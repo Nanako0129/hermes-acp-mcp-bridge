@@ -77,23 +77,42 @@ def _default_permission_decider(
     tool_call = params.get("toolCall") if isinstance(params.get("toolCall"), dict) else {}
     title = str(tool_call.get("title") or "")
     raw_input = tool_call.get("rawInput") if isinstance(tool_call.get("rawInput"), dict) else {}
+    meta = tool_call.get("_meta") if isinstance(tool_call.get("_meta"), dict) else {}
+    mcp_meta = meta.get("mcp") if isinstance(meta.get("mcp"), dict) else {}
+    meta_server = str(mcp_meta.get("server") or "").strip()
+    meta_tool = str(mcp_meta.get("tool") or "").strip()
     tool_name = str(
-        tool_call.get("name")
+        meta_tool
+        or tool_call.get("name")
         or raw_input.get("tool")
         or raw_input.get("name")
         or ""
     ).strip()
 
+    is_meta_match = bool(
+        meta.get("is_mcp_tool_call")
+        and (not server_name or meta_server == server_name)
+        and meta_tool in allowed_tools
+    )
+    is_title_match = any(
+        title == name
+        or title == f"{server_name}_{name}"
+        or title == f"{server_name}: {name}"
+        or title.startswith(f"{server_name}: {name} ")
+        for name in allowed_tools
+    )
     is_bridge_tool = (
-        tool_name in allowed_tools
-        or any(title == name or title.startswith(f"{server_name}: {name}") for name in allowed_tools)
+        is_meta_match
+        or (tool_name in allowed_tools and (not meta_server or meta_server == server_name))
+        or is_title_match
         or (server_name and f"mcp__{server_name}__" in tool_name)
     )
     options = params.get("options") or []
     if is_bridge_tool:
-        for opt in options:
-            if isinstance(opt, dict) and opt.get("kind") in ("allow_once", "allow_always"):
-                return str(opt.get("optionId") or "")
+        for kind in ("allow_once", "allow_always"):
+            for opt in options:
+                if isinstance(opt, dict) and opt.get("kind") == kind:
+                    return str(opt.get("optionId") or "")
     for opt in options:
         if isinstance(opt, dict) and opt.get("kind") in ("reject_once", "reject_always"):
             return str(opt.get("optionId") or "")

@@ -70,3 +70,32 @@ def test_hermes_registry_executor_adapter() -> None:
     out = exec_fn("read_file", {"path": "README.md"})
     assert out == {"ok": True, "tool": "read_file"}
     assert reg.seen == [("read_file", {"path": "README.md"}, "cli", {"task_id": "t-1"})]
+
+
+def test_permission_decider_matches_real_acp_mcp_metadata() -> None:
+    from hermes_acp_mcp_bridge.acp_bridge import _default_permission_decider
+
+    options = [
+        {"optionId": "allow_always", "name": "Allow Always", "kind": "allow_always"},
+        {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+        {"optionId": "deny", "name": "Deny", "kind": "reject_once"},
+    ]
+    allowed_params = {
+        "toolCall": {
+            "toolCallId": "48a154",
+            "kind": "other",
+            "title": "hermes-tools_lookup_kv",
+            "_meta": {"mcp": {"tool": "lookup_kv", "server": "hermes-tools"}, "is_mcp_tool_call": True},
+        },
+        "options": options,
+    }
+    assert _default_permission_decider(allowed_params, {"lookup_kv"}, "hermes-tools") == "allow"
+
+    other_server = {
+        "toolCall": {
+            "title": "foreign_lookup_kv",
+            "_meta": {"mcp": {"tool": "lookup_kv", "server": "foreign"}, "is_mcp_tool_call": True},
+        },
+        "options": options,
+    }
+    assert _default_permission_decider(other_server, {"lookup_kv"}, "hermes-tools") == "deny"
