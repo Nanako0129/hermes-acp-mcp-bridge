@@ -9,8 +9,10 @@ import queue
 import subprocess
 import threading
 import time
+from collections.abc import Callable, Sequence
+import contextlib
 from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence
+from typing import Any
 
 from .mcp_server import (
     BridgeToolError,
@@ -216,7 +218,7 @@ class ACPMCPBridge:
         try:
             entry.mcp_server.close()
         finally:
-            try:
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
                 if entry.proc.poll() is None:
                     entry.proc.terminate()
                     try:
@@ -224,8 +226,6 @@ class ACPMCPBridge:
                     except subprocess.TimeoutExpired:
                         entry.proc.kill()
                         entry.proc.wait(timeout=1.5)
-            except Exception:
-                pass
 
     def _acquire(
         self,
@@ -299,7 +299,7 @@ class ACPMCPBridge:
                 raw_line = entry.inbox.get(timeout=min(0.25, remaining))
             except queue.Empty:
                 if entry.proc.poll() is not None:
-                    raise BridgeToolError(f"ACP server exited unexpectedly during {method}")
+                    raise BridgeToolError(f"ACP server exited unexpectedly during {method}") from None
                 continue
             if raw_line is None:
                 raise BridgeToolError(f"ACP server closed stdout during {method}")

@@ -9,8 +9,9 @@ import secrets
 import socketserver
 import threading
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence
+from typing import Any, Self
 from urllib.parse import urlparse
 
 
@@ -183,7 +184,7 @@ class StreamableHTTPMCPServer:
             "headers": [{"name": "Authorization", "value": f"Bearer {self._token}"}],
         }
 
-    def start(self) -> "StreamableHTTPMCPServer":
+    def start(self) -> Self:
         if self._httpd is not None:
             return self
         bridge = self
@@ -253,7 +254,7 @@ class StreamableHTTPMCPServer:
                 raw = self.rfile.read(content_len)
                 try:
                     msg = json.loads(raw.decode("utf-8"))
-                except Exception:
+                except (UnicodeDecodeError, json.JSONDecodeError):
                     self._send_json(
                         400,
                         {
@@ -377,7 +378,7 @@ class StreamableHTTPMCPServer:
         try:
             raw_result = executor(tool_name, dict(arguments))
             text, is_error = _normalize_tool_result(raw_result)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - isolate arbitrary tool handler failures
             text, is_error = f"Tool execution error ({tool_name}): {exc}", True
         elapsed = time.monotonic() - started
 
@@ -409,8 +410,8 @@ class StreamableHTTPMCPServer:
             self._thread.join(timeout=2.0)
             self._thread = None
 
-    def __enter__(self) -> "StreamableHTTPMCPServer":
+    def __enter__(self) -> Self:
         return self.start()
 
-    def __exit__(self, *args: Any) -> None:
+    def __exit__(self, *args: object) -> None:
         self.close()
