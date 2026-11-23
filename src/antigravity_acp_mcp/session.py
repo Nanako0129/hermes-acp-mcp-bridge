@@ -3,6 +3,7 @@ tools disabled, model selection, prompt with stopReason mapping, cancel."""
 
 from __future__ import annotations
 
+import logging
 import queue
 from dataclasses import dataclass
 from typing import Any
@@ -10,8 +11,11 @@ from typing import Any
 from .acp_connection import AcpConnection, AcpError
 from .permission import PermissionGate
 
-# MEASURED on agy 1.5.2: ``_meta.antigravity.disabledTools`` is the key that works;
-# ``_meta.agy.disabledTools`` did not visibly disable anything.
+logger = logging.getLogger(__name__)
+
+# MEASURED on agy 1.5.2: ``_meta.antigravity.disabledTools`` disables every native tool in the S1 matrix
+# (``_meta.agy.disabledTools`` also disables run_command; only the antigravity key was matrix-tested).
+THINKING_LEVELS = ("low", "medium", "high", "xhigh")  # agy composite model-id suffixes, ascending
 NATIVE_TOOLS = [
     "view_file", "view_file_outline", "view_code_item", "multimodal_view_file", "list_dir",
     "list_directory", "find_by_name", "grep_search", "code_search", "codebase_search",
@@ -48,11 +52,14 @@ class AcpSession:
         self.gate = gate
         self.updates: queue.Queue[dict[str, Any]] = queue.Queue()  # session/update payloads
 
-    def prompt(self, text: str, timeout: float | None = None) -> PromptResult:
+    def prompt(self, blocks: str | list[dict[str, Any]], timeout: float | None = None) -> PromptResult:
+        if isinstance(blocks, str):
+            blocks = [{"type": "text", "text": blocks}]
+        if not self.conn.supports_images and any(b.get("type") == "image" for b in blocks):
+            logger.warning("acp-mcp: agent did not declare image prompts; images dropped from this prompt")
+            blocks = [b for b in blocks if b.get("type") != "image"]
         result = self.conn.request(
-            "session/prompt",
-            {"sessionId": self.session_id, "prompt": [{"type": "text", "text": text}]},
-            timeout=timeout,
+            "session/prompt", {"sessionId": self.session_id, "prompt": blocks}, timeout=timeout,
         )
         result = result if isinstance(result, dict) else {}
         stop = result.get("stopReason")
@@ -73,6 +80,7 @@ def new_session(
     mcp_server: dict[str, Any],
     gate: PermissionGate,
     model: str | None = None,
+    thinking: str | None = None,
 ) -> AcpSession:
     # Never log these params: mcp_server carries the bearer (L1).
     result = conn.request(
@@ -91,12 +99,58 @@ def new_session(
         session.updates.put(update)
 
     conn.attach_session(session.session_id, on_update, gate.decide)
-    if model:
-        select_model(conn, session.session_id, result, model)
+    if model or thinking:
+        select_model(conn, session.session_id, result, model or "", thinking)
     return session
 
 
-def select_model(conn: AcpConnection, session_id: str, new_result: dict[str, Any], model: str) -> None:
+def _nearest(thinking: str, offered: list[str]) -> str | None:
+    """The offered level closest to ``thinking`` (ties go to the lower level)."""
+    if thinking not in THINKING_LEVELS:
+        return None
+    want = THINKING_LEVELS.index(thinking)
+    ranked = sorted((abs(THINKING_LEVELS.index(o) - want), THINKING_LEVELS.index(o), o)
+                    for o in offered if o in THINKING_LEVELS)
+    return ranked[0][2] if ranked else None
+
+
+def _composite(model: str, thinking: str | None, legacy_ids: list[str]) -> str:
+    """``<base>-<level>`` nearest to ``thinking`` among the siblings agy offers when ``model`` is a composite id
+    (``gemini-4-hydrogen-medium``), else ``model``."""
+    base, _, suffix = model.rpartition("-")
+    if not thinking or suffix not in THINKING_LEVELS:
+        return model
+    level = _nearest(thinking, [i.rpartition("-")[2] for i in legacy_ids if i.rpartition("-")[0] == base])
+    return f"{base}-{level}" if level else model
+
+
+def select_model(conn: AcpConnection, session_id: str, new_result: dict[str, Any], model: str,
+                 thinking: str | None = None) -> None:
+    """Pick the model, then the thinking level.
+
+    A composite id (``gemini-4-hydrogen-medium``) carries its level: the requested level swaps the suffix when agy
+    offers siblings (nearest offered level; covers ``xhigh``). Otherwise the ``thought_level`` option is set to
+    the nearest level it offers.
+    """
+    legacy = [str(m.get("modelId")) for m in (new_result.get("models") or {}).get("availableModels") or []
+              if isinstance(m, dict)]
+    picked = _composite(model, thinking, legacy) if model else ""
+    if picked:
+        _set_model(conn, session_id, new_result, picked)
+    if not thinking or picked.rpartition("-")[2] == thinking:
+        return  # the composite id carries the requested level itself
+    for option in new_result.get("configOptions") or []:
+        if isinstance(option, dict) and option.get("category") == "thought_level":
+            offered = [str(o.get("value")) for o in option.get("options") or [] if isinstance(o, dict)]
+            value = _nearest(thinking, offered)
+            if value:
+                conn.request("session/set_config_option",
+                             {"sessionId": session_id, "configId": option.get("id") or "thinking_level",
+                              "value": value}, timeout=30.0)
+            return
+
+
+def _set_model(conn: AcpConnection, session_id: str, new_result: dict[str, Any], model: str) -> None:
     """set_config_option on the ``model`` option when it offers ``model``, else set_model."""
     for option in new_result.get("configOptions") or []:
         if not isinstance(option, dict) or "model" not in (option.get("category"), option.get("id")):

@@ -132,8 +132,13 @@ class AcpConnection:
         for t in self._threads:
             t.start()
 
+    supports_images = False  # agentCapabilities.promptCapabilities.image from initialize
+
     def initialize(self, timeout: float | None = 30.0) -> dict[str, Any]:
-        return self.request("initialize", INITIALIZE_PARAMS, timeout=timeout)
+        result = self.request("initialize", INITIALIZE_PARAMS, timeout=timeout)
+        caps = (result or {}).get("agentCapabilities") or {} if isinstance(result, dict) else {}
+        self.supports_images = bool((caps.get("promptCapabilities") or {}).get("image"))
+        return result
 
     def close(self) -> None:
         """Reap the child: stdin EOF, then terminate, then kill."""

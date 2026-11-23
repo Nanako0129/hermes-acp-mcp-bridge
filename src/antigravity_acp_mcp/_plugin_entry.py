@@ -23,6 +23,13 @@ class AntigravityAcpMcpProfile(ProviderProfile):
             client_kwargs["base_url"] = self.base_url
         return AntigravityAcpMcpClient(**client_kwargs)
 
+    def build_api_kwargs_extras(self, *, reasoning_config: dict | None = None, **_: Any) -> tuple[dict, dict]:
+        """Hermes' reasoning effort reaches the client as ``reasoning_effort`` (mapped to agy's thinking level)."""
+        if not isinstance(reasoning_config, dict):
+            return {}, {}
+        effort = "none" if reasoning_config.get("enabled") is False else str(reasoning_config.get("effort") or "")
+        return {}, ({"reasoning_effort": effort} if effort else {})
+
 
 antigravity_acp_mcp = AntigravityAcpMcpProfile(
     name="antigravity-acp-mcp",
@@ -33,7 +40,7 @@ antigravity_acp_mcp = AntigravityAcpMcpProfile(
     env_vars=(),
     base_url="acp://antigravity-mcp",
     auth_type="external_process",
-    supports_vision=False,
+    supports_vision=True,  # images go to agy as ACP image blocks / MCP image content
     process_command=os.environ.get("HERMES_ANTIGRAVITY_ACP_MCP_COMMAND", "").strip() or _DEFAULT_COMMAND,
     process_args=(),
     process_command_env_vars=("HERMES_ANTIGRAVITY_ACP_MCP_COMMAND",),

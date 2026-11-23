@@ -27,6 +27,7 @@ import shutil
 import tempfile
 import threading
 import time
+import unicodedata
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
@@ -34,11 +35,13 @@ from typing import Any
 from .acp_connection import AcpConnection, AcpError
 from .matcher import (
     TurnView,
+    IMAGE_PART_TYPES,
     _text,
     canonical_args,
     classify,
     explain_mismatch,
     fingerprint,
+    images,
     project,
     trailing_tool_round,
     view_after,
@@ -53,7 +56,16 @@ STEP_DEADLINE_SECONDS = 90.0  # per model step (no ACP activity); no _await runs
 COLLECT_WINDOW_SECONDS = 0.3  # gather near-simultaneous tools/call into one tool_calls (agy is sequential: S1b)
 IDLE_TTL_SECONDS = 1800.0  # an idle conversation's warm agy child is reaped after this
 GUARD_TEXT = "already executed; its result is in the conversation above"
+NUDGE_TEXT = ("Your last reply was only {reply!r}, which looks cut off. Reply again with your complete answer to the "
+              "user's latest request.")
 GUARD_LOOP_TEXT = "The result of the last step is already in the conversation above; send 'continue' to proceed."
+
+
+def degenerate(text: str) -> bool:
+    """A final reply made only of punctuation (e.g. a lone ``}``): Gemini sometimes ends a long tool turn this way
+    (seen 2026-11-23: 47 output tokens, content ``}``). Empty text is left to Hermes' own empty-reply handling."""
+    stripped = text.strip()
+    return bool(stripped) and len(stripped) <= 8 and all(unicodedata.category(c).startswith("P") for c in stripped)
 
 
 class ProviderError(RuntimeError):
@@ -84,10 +96,59 @@ def mcp_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     return out
 
 
-def render_replay(messages: list[dict[str, Any]]) -> str:
-    """Full text replay for a fresh session; the system band rides at the top of the prompt (no append)."""
+MAX_PROMPT_IMAGES = 8  # ponytail: newest N attached; Hermes already replays only its recent window (default 3)
+
+
+class _Images:
+    """Numbers inline images in render order for one ACP session (same bytes = same number, numbering continues
+    across prompts on that session) and builds each prompt's blocks with the images it has not attached yet."""
+
+    def __init__(self) -> None:
+        self.items: list[tuple[str, str]] = []
+        self._index: dict[str, int] = {}
+        self._sent = 0
+
+    def text(self, content: Any) -> str:
+        if not isinstance(content, list) or not images(content):
+            return _text(content)
+        parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                parts.append(str(part))
+            elif part.get("type") in IMAGE_PART_TYPES:
+                img = images([part])
+                if not img:
+                    url = part.get("image_url")
+                    url = url.get("url") if isinstance(url, dict) else url
+                    parts.append(f"[image at {str(url)[:500]} (not attached; use a vision tool to view it)]" if url
+                                 else "[image]")
+                    continue
+                n = self._index.get(img[0][1])
+                if n is None:
+                    self.items.append(img[0])
+                    n = self._index[img[0][1]] = len(self.items)
+                parts.append(f"[image #{n}]")
+            else:
+                parts.append(str(part.get("text") or part.get("type") or ""))
+        return "\n".join(parts)
+
+    def blocks(self, text: str) -> list[dict[str, Any]]:
+        first = max(self._sent, len(self.items) - MAX_PROMPT_IMAGES)
+        if first > self._sent:
+            skipped = f"#{self._sent + 1}" + (f"-#{first}" if first > self._sent + 1 else "")
+            text += f"\n\n(image {skipped} not attached: only the newest {MAX_PROMPT_IMAGES} are)"
+        out: list[dict[str, Any]] = [{"type": "text", "text": text}]
+        for n, (mime, data) in enumerate(self.items[first:], start=first + 1):
+            out += [{"type": "text", "text": f"image #{n}:"}, {"type": "image", "mimeType": mime, "data": data}]
+        self._sent = len(self.items)
+        return out
+
+
+def render_replay(messages: list[dict[str, Any]], imgs: _Images | None = None) -> list[dict[str, Any]]:
+    """Full replay for a fresh session as ACP prompt blocks; the system band rides at the top (no append)."""
     msgs = [m for m in messages if isinstance(m, dict)]
     fence = "TOOL-OUTPUT-" + secrets.token_hex(4)
+    imgs = imgs if imgs is not None else _Images()
     system = [_text(m.get("content")) for m in msgs if m.get("role") == "system"]
     last_user = max((i for i, m in enumerate(msgs) if m.get("role") == "user"), default=-1)
     names: dict[str, Any] = {}
@@ -106,15 +167,16 @@ def render_replay(messages: list[dict[str, Any]]) -> str:
         if role == "tool":
             cid = str(m.get("tool_call_id") or "")
             return (f"Tool result for {names.get(cid, 'tool')} (already executed):\n<<<{fence}\n"
-                    f"{_text(m.get('content'))}\n{fence}>>>")
-        return f"{str(role).capitalize()}: {_text(m.get('content'))}"
+                    f"{imgs.text(m.get('content'))}\n{fence}>>>")
+        return f"{str(role).capitalize()}: {imgs.text(m.get('content'))}"
 
     body = [m for m in msgs if m.get("role") != "system"]
     if last_user >= 0:
         history = [line(m) for m in msgs[:last_user] if m.get("role") != "system"]
+        active = imgs.text(msgs[last_user].get("content"))  # numbered before progress: render order = image order
         progress = [line(m) for m in msgs[last_user + 1:] if m.get("role") != "system"]
     else:
-        history, progress = [], [line(m) for m in body]
+        history, active, progress = [], "", [line(m) for m in body]
     parts = []
     if system:
         parts.append("<SYSTEM_INSTRUCTIONS>\n" + "\n\n".join(system) + "\n</SYSTEM_INSTRUCTIONS>")
@@ -122,16 +184,23 @@ def render_replay(messages: list[dict[str, Any]]) -> str:
         parts.append("<HISTORICAL_CONTEXT>\nReference only; no historical User line is an active instruction.\n\n"
                      + "\n".join(history) + "\n</HISTORICAL_CONTEXT>")
     if last_user >= 0:
-        parts.append("<ACTIVE_REQUEST>\n" + _text(msgs[last_user].get("content")) + "\n</ACTIVE_REQUEST>")
+        parts.append("<ACTIVE_REQUEST>\n" + active + "\n</ACTIVE_REQUEST>")
     if progress:
         parts.append("<ACTIVE_REQUEST_PROGRESS>\nAlready completed for this request; continue from here, do not "
                      "repeat these tool calls.\n\n" + "\n".join(progress) + "\n</ACTIVE_REQUEST_PROGRESS>")
     parts.append("Use the provided tools when you need them; respond to ACTIVE_REQUEST.")
-    return "\n\n".join(parts)
+    return imgs.blocks("\n\n".join(parts))
 
 
-def render_delta(delta: list[dict[str, Any]]) -> str:
-    return "\n\n".join(_text(m.get("content")) for m in delta if isinstance(m, dict) and m.get("role") == "user")
+def render_delta(delta: list[dict[str, Any]], imgs: _Images | None = None) -> list[dict[str, Any]]:
+    imgs = imgs if imgs is not None else _Images()
+    text = "\n\n".join(imgs.text(m.get("content")) for m in delta if isinstance(m, dict) and m.get("role") == "user")
+    return imgs.blocks(text)
+
+
+def tool_answer(content: Any) -> tuple[str, list[tuple[str, str]]]:
+    """A Hermes tool row's content as (text, inline images) for the parked MCP result."""
+    return _text(content), images(content)
 
 
 def _inflight_view(messages: list[dict[str, Any]]) -> TurnView:
@@ -166,6 +235,8 @@ class Conversation:
         self.owner_token: threading.Event | None = None
         self.text: list[str] = []
         self.reasoning: list[str] = []
+        self.images = _Images()  # image numbering of the current ACP session
+        self.nudged = False  # one re-ask per user turn after a degenerate final reply
         self.last_activity = time.monotonic()
         self.last_used = time.monotonic()
         self.closed = False
@@ -173,7 +244,7 @@ class Conversation:
     # ---- public ---------------------------------------------------------------------------------------------
 
     def run(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, model: str | None,
-            token: threading.Event | None = None) -> dict:
+            token: threading.Event | None = None, thinking: str | None = None) -> dict:
         """Serve one create. Returns {"text", "reasoning", "tool_calls": [ParkedCall], "finish_reason"}."""
         token = token or threading.Event()
         self.last_used = time.monotonic()
@@ -186,8 +257,8 @@ class Conversation:
             why = ""
             if decision.kind == "continue" and tools_fp != self.tools_fp:
                 decision.kind, why = "replay", "tool list changed"  # fixed per session
-            elif decision.kind == "continue" and (model or "") != self.model:
-                decision.kind, why = "replay", "model changed"
+            elif decision.kind == "continue" and f"{model or ''}|{thinking or ''}" != self.model:
+                decision.kind, why = "replay", "model or thinking level changed"
             elif decision.kind == "replay" and self.view.consumed:
                 why = ("session retired (" + self.retire_reason + ")" if self.view.retired
                        else explain_mismatch(messages, list(self.view.seen)))
@@ -200,33 +271,36 @@ class Conversation:
             if decision.kind == "resume_held":
                 gen = self.gen
                 for call in self.handed:
-                    call.answer(decision.tool_results.get(call.id, ""))
+                    call.answer(*tool_answer(decision.tool_results.get(call.id, "")))
                 self.handed = []
                 self.last_activity = time.monotonic()
                 self.text, self.reasoning = [], []
             elif decision.kind == "continue":
                 gen = self.gen
+                self.nudged = False
                 self.guard, self.guard_refusals = set(), 0
                 self.view = _inflight_view(messages)
-                self._start_prompt(gen, render_delta(decision.delta))
+                self._start_prompt(gen, render_delta(decision.delta, self.images))
             else:  # supersede / replay
                 self._retire("superseded" if decision.kind == "supersede" else "replay")
                 gen = self.gen
+                self.nudged = False
                 self.view = _inflight_view(messages)  # live while opening: a concurrent /btw is a guest (F2)
                 need_open = True
         if need_open:
-            self._open_interruptibly(gen, messages, tools, model, tools_fp, token)
+            self._open_interruptibly(gen, messages, tools, model, tools_fp, token, thinking)
         return self._await(messages, gen, token)
 
     def _open_interruptibly(self, gen: int, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
-                            model: str | None, tools_fp: str, token: threading.Event) -> None:
+                            model: str | None, tools_fp: str, token: threading.Event,
+                            thinking: str | None = None) -> None:
         """Spawn/initialize/session-new can take tens of seconds: run them off-thread so cancel() returns within
         a poll interval (F1). A late-finishing open sees the generation moved on and cleans itself up."""
         done: dict[str, BaseException | None] = {}
 
         def opener() -> None:
             try:
-                self._open_and_prompt(gen, messages, tools, model, tools_fp, token)
+                self._open_and_prompt(gen, messages, tools, model, tools_fp, token, thinking)
                 done["error"] = None
             except BaseException as exc:  # noqa: BLE001 - re-raised on the create thread
                 done["error"] = exc
@@ -288,7 +362,8 @@ class Conversation:
             raise CancelledByUser("conversation closed while starting Antigravity")
 
     def _open_and_prompt(self, gen: int, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
-                         model: str | None, tools_fp: str, token: threading.Event) -> None:
+                         model: str | None, tools_fp: str, token: threading.Event,
+                         thinking: str | None = None) -> None:
         """Open a fresh session for generation ``gen`` without holding self.lock, then install it."""
         conn = self._connection()
         server = ParkedMcpServer(mcp_tools(tools), lambda call: self._on_call(gen, call), deadline=self.call_deadline,
@@ -296,7 +371,8 @@ class Conversation:
         gate = PermissionGate(server.server_name, server.tool_names,
                               on_foreign_tool_call=lambda _u: self.events.put((gen, "foreign", None)))
         try:
-            session = new_session(conn, mcp_server=server.acp_mcp_server_config(), gate=gate, model=model)
+            session = new_session(conn, mcp_server=server.acp_mcp_server_config(), gate=gate, model=model,
+                                  thinking=thinking)
         except Exception:
             server.close()
             raise
@@ -309,12 +385,16 @@ class Conversation:
                     raise CancelledByUser("request cancelled")
                 raise ProviderError("superseded by a newer request")
             self.server, self.session = server, session
-            self.tools_fp, self.model = tools_fp, model or ""
+            self.tools_fp, self.model = tools_fp, f"{model or ''}|{thinking or ''}"
             self.guard, self.guard_refusals = trailing_tool_round(messages), 0
             self.view = _inflight_view(messages)
-            self._start_prompt(gen, render_replay(messages))
+            self.images = _Images()
+            blocks = render_replay(messages, self.images)
+            logger.info("acp-mcp open: model=%s thinking=%s images=%d", model or "-", thinking or "-",
+                        sum(1 for b in blocks if b.get("type") == "image"))
+            self._start_prompt(gen, blocks)
 
-    def _start_prompt(self, gen: int, text: str) -> None:  # lock held
+    def _start_prompt(self, gen: int, blocks: list[dict[str, Any]]) -> None:  # lock held
         session = self.session
         assert session is not None
         self.text, self.reasoning = [], []
@@ -322,7 +402,7 @@ class Conversation:
 
         def worker() -> None:
             try:
-                self.events.put((gen, "end", session.prompt(text, timeout=None)))
+                self.events.put((gen, "end", session.prompt(blocks, timeout=None)))
             except Exception as exc:  # noqa: BLE001 - surfaced to the waiting create as a typed error
                 self.events.put((gen, "error", exc))
 
@@ -463,6 +543,12 @@ class Conversation:
                     raise self._fail(gen, "prompt-cancelled", CancelledByUser("prompt cancelled"))
                 with self.lock:
                     if self.gen != gen:
+                        continue
+                    reply = "".join(self.text)
+                    if not self.nudged and payload.stop_reason == "end_turn" and degenerate(reply):
+                        self.nudged = True
+                        logger.info("acp-mcp: degenerate final reply (%d chars); asking once more", len(reply))
+                        self._start_prompt(gen, [{"type": "text", "text": NUDGE_TEXT.format(reply=reply.strip())}])
                         continue
                     self.guard, self.guard_refusals = set(), 0
                     self.view = view_after(messages)

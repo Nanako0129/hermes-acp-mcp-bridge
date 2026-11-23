@@ -50,20 +50,23 @@ class ParkedCall:
         self.state = "parked"  # parked | answered | abandoned | deadline
         self.text = ""
         self.is_error = False
+        self.images: list[tuple[str, str]] = []  # (mimeType, base64) sent as MCP image content
         self.drop_connection = False
         self._lock = threading.Lock()
         self._done = threading.Event()
 
-    def _finish(self, state: str, text: str, is_error: bool, drop: bool = False) -> bool:
+    def _finish(self, state: str, text: str, is_error: bool, drop: bool = False,
+                images: list[tuple[str, str]] | None = None) -> bool:
         with self._lock:
             if self.state != "parked":
                 return False
             self.state, self.text, self.is_error, self.drop_connection = state, text, is_error, drop
+            self.images = list(images or [])
         self._done.set()
         return True
 
-    def answer(self, text: str, is_error: bool = False) -> bool:
-        return self._finish("answered", text, is_error)
+    def answer(self, text: str, images: list[tuple[str, str]] | None = None, is_error: bool = False) -> bool:
+        return self._finish("answered", text, is_error, images=images)
 
     def abandon(self, reason: str = "superseded", *, drop_connection: bool = False) -> bool:
         return self._finish("abandoned", reason, True, drop_connection)
@@ -81,12 +84,10 @@ def _rpc_error(req_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
 
-def _tool_result(req_id: Any, text: str, is_error: bool) -> dict[str, Any]:
-    return {
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "result": {"content": [{"type": "text", "text": text}], "isError": is_error},
-    }
+def _tool_result(req_id: Any, text: str, is_error: bool, images: list[tuple[str, str]] = ()) -> dict[str, Any]:
+    content = [{"type": "text", "text": text}]
+    content += [{"type": "image", "mimeType": mime, "data": data} for mime, data in images]
+    return {"jsonrpc": "2.0", "id": req_id, "result": {"content": content, "isError": is_error}}
 
 
 class ParkedMcpServer:
@@ -293,4 +294,4 @@ class ParkedMcpServer:
                 del self._live[signature]
         if call.drop_connection:
             return _DROP
-        return _tool_result(req_id, call.text, call.is_error)
+        return _tool_result(req_id, call.text, call.is_error, call.images)

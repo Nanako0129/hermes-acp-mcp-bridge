@@ -2,6 +2,8 @@
 
 early_update       send a session/update for the new session BEFORE the session/new reply
 config_options     configOptions list returned by session/new
+legacy_models      models.availableModels modelIds returned by session/new
+prompt_images      initialize declares agentCapabilities.promptCapabilities.image
 flood_stderr       bytes of stderr written (blocking) before the initialize reply
 stderr_lines       lines written to stderr when exiting
 exit_on            method on which to write stderr_lines and exit with exit_code
@@ -58,12 +60,16 @@ while True:
         for _ in range(B.get("flood_stderr", 0) // 100):
             sys.stderr.write("x" * 99 + "\n")  # blocks forever if the client never drains
         sys.stderr.flush()
-        emit({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": 1}})
+        caps = {"promptCapabilities": {"image": True}} if B.get("prompt_images") else {}
+        emit({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": 1, "agentCapabilities": caps}})
     elif method == "session/new":
         sid = "sess-1"
         if B.get("early_update"):
             update(sid, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "early"}})
-        emit({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": sid, "configOptions": B.get("config_options", [])}})
+        result = {"sessionId": sid, "configOptions": B.get("config_options", [])}
+        if B.get("legacy_models"):
+            result["models"] = {"availableModels": [{"modelId": m} for m in B["legacy_models"]]}
+        emit({"jsonrpc": "2.0", "id": rid, "result": result})
     elif method == "session/prompt":
         sid = params["sessionId"]
         for u in B.get("update_on_prompt", []):

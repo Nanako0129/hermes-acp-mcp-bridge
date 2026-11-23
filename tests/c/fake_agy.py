@@ -54,7 +54,8 @@ def mcp_call(server, name, arguments):
         return {"error": type(exc).__name__}
     res = data.get("result") or {}
     text = "".join(c.get("text", "") for c in res.get("content", []))
-    return {"text": text, "isError": bool(res.get("isError"))}
+    imgs = [c.get("mimeType") for c in res.get("content", []) if c.get("type") == "image"]
+    return {"text": text, "isError": bool(res.get("isError")), **({"images": imgs} if imgs else {})}
 
 
 def run_prompt(rid, sid, text, steps, token):
@@ -105,7 +106,8 @@ def main():
         method, rid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
         if method == "initialize":
             emit({"jsonrpc": "2.0", "id": rid, "result": {
-                "protocolVersion": 1, "agentCapabilities": {"mcpCapabilities": {"http": True}}}})
+                "protocolVersion": 1, "agentCapabilities": {"mcpCapabilities": {"http": True},
+                                                            "promptCapabilities": {"image": True}}}})
         elif method == "session/new":
             state["next_sid"] += 1
             sid = f"s{state['next_sid']}"
@@ -121,8 +123,9 @@ def main():
         elif method == "session/prompt":
             sid = params["sessionId"]
             text = params["prompt"][0]["text"]
+            images = [b.get("mimeType") for b in params["prompt"] if b.get("type") == "image"]
             n = sum(1 for line in open(LOG) if '"ev": "prompt"' in line) if LOG and __import__("os").path.exists(LOG) else 0
-            log(ev="prompt", sid=sid, n=n, text=text)
+            log(ev="prompt", sid=sid, n=n, text=text, images=images)
             script = B.get("script", [])
             steps = script[n] if n < len(script) else [{"text": "ok"}]
             token = {"cancelled": False, "done": False, "rid": rid}

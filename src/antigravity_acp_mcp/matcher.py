@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,10 +43,33 @@ class TurnView:
 class Decision:
     kind: str
     delta: list[dict[str, Any]] = field(default_factory=list)
-    tool_results: dict[str, str] = field(default_factory=dict)  # call id -> tool content (resume_held)
+    tool_results: dict[str, Any] = field(default_factory=dict)  # call id -> raw tool content (resume_held)
+
+
+IMAGE_PART_TYPES = ("image", "image_url", "input_image")
+_DATA_URL = re.compile(r"^data:([\w.+-]+/[\w.+-]+)(?:;[^,;]+)*;base64,(.*)$", re.DOTALL)
+
+
+def _image(part: dict[str, Any]) -> tuple[str, str] | None:
+    """(mimeType, base64 data) of an inline image part; None for remote URLs and non-images."""
+    if part.get("type") == "image" and part.get("data"):
+        return str(part.get("mimeType") or part.get("mime_type") or "image/png"), str(part["data"])
+    url = part.get("image_url")
+    url = url.get("url") if isinstance(url, dict) else url
+    m = _DATA_URL.match(str(url or ""))
+    return (m.group(1), m.group(2)) if m else None
+
+
+def images(content: Any) -> list[tuple[str, str]]:
+    """Inline images of a message's content, in order."""
+    if not isinstance(content, list):
+        return []
+    return [img for p in content if isinstance(p, dict) and p.get("type") in IMAGE_PART_TYPES
+            and (img := _image(p))]
 
 
 def _text(content: Any) -> str:
+    """Text of a message's content; each image part becomes an ``[image]`` placeholder at its position."""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -54,11 +78,16 @@ def _text(content: Any) -> str:
         parts = []
         for part in content:
             if isinstance(part, dict):
-                parts.append(str(part.get("text") or part.get("type") or ""))
+                parts.append("[image]" if part.get("type") in IMAGE_PART_TYPES
+                             else str(part.get("text") or part.get("type") or ""))
             else:
                 parts.append(str(part))
         return "\n".join(parts)
     return str(content)
+
+
+def _image_ids(content: Any) -> tuple[str, ...]:
+    return tuple(hashlib.sha256(data.encode()).hexdigest()[:16] for _, data in images(content))
 
 
 def _tool_call_ids(message: dict[str, Any]) -> tuple[str, ...]:
@@ -71,9 +100,10 @@ def project(message: dict[str, Any]) -> tuple:
     role = str(message.get("role") or "")
     if role == "assistant":
         return ("assistant", tuple(sorted(_tool_call_ids(message))))
+    content = message.get("content")
     if role == "tool":
-        return ("tool", str(message.get("tool_call_id") or ""), _text(message.get("content")))
-    return (role, _text(message.get("content")))
+        return ("tool", str(message.get("tool_call_id") or ""), _image_ids(content), _text(content))
+    return (role, _image_ids(content), _text(content))
 
 
 def fingerprint(messages: list[dict[str, Any]]) -> str:
@@ -111,7 +141,7 @@ def classify(messages: list[dict[str, Any]], view: TurnView | None, tools: list[
             tail = msgs[last_call + 1:]
             ids = [str(m.get("tool_call_id") or "") for m in tail]
             if tail and all(m.get("role") == "tool" for m in tail) and len(ids) == len(set(ids)) and set(ids) == held:
-                return Decision("resume_held", tool_results={str(m["tool_call_id"]): _text(m.get("content"))
+                return Decision("resume_held", tool_results={str(m["tool_call_id"]): m.get("content")
                                                              for m in tail})
     if len(msgs) <= view.consumed or fingerprint(msgs[:view.consumed]) != view.prefix_fp:
         return Decision("replay")
@@ -139,6 +169,8 @@ def explain_mismatch(messages: list[dict[str, Any]], seen: list[tuple]) -> str:
                 return f"index {i}: assistant tool-call ids differ ({len(old[1])} -> {len(new[1])} calls)"
             if new[0] == "tool" and new[1] != old[1]:
                 return f"index {i}: tool_call_id differs"
+            if new[-2] != old[-2]:
+                return f"index {i}: {new[0]} images differ ({len(old[-2])} -> {len(new[-2])})"
             old_t, new_t = old[-1], new[-1]
             common = next((k for k in range(min(len(old_t), len(new_t))) if old_t[k] != new_t[k]),
                           min(len(old_t), len(new_t)))

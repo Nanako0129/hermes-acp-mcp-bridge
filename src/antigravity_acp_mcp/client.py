@@ -14,6 +14,15 @@ from .acp_connection import AcpConnection
 from .conversation import Conversation, Registry
 
 ACP_MARKER_BASE_URL = "acp://antigravity-mcp"
+THINKING_ENV = "HERMES_ANTIGRAVITY_ACP_MCP_THINKING_LEVEL"  # low|medium|high|xhigh; overrides reasoning_effort
+_EFFORT_TO_THINKING = {"none": "low", "minimal": "low", "low": "low", "medium": "medium", "high": "high",
+                       "xhigh": "xhigh", "max": "xhigh", "ultra": "xhigh"}
+
+
+def thinking_level(reasoning_effort: Any) -> str | None:
+    """agy thinking level for Hermes' effort; None keeps the model id's own level."""
+    override = os.environ.get(THINKING_ENV, "").strip().lower()
+    return _EFFORT_TO_THINKING.get(override or str(reasoning_effort or "").strip().lower())
 
 
 def _default_command() -> tuple[str, list[str]]:
@@ -89,22 +98,24 @@ class AntigravityAcpMcpClient:
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=_DualModeCompletionCreate(self)))
 
     def _create_chat_completion(self, *, model: str | None = None, messages: list[dict[str, Any]] | None = None,
-                                tools: list[dict[str, Any]] | None = None, stream: bool = False, **_: Any) -> Any:
+                                tools: list[dict[str, Any]] | None = None, stream: bool = False,
+                                reasoning_effort: Any = None, **_: Any) -> Any:
         messages = list(messages or [])
         registry = _registry(self._command, self._args)
         key = _conversation_affinity(messages, os.getcwd())
         conv = registry.get(key)
         token = threading.Event()  # request-scoped cancel token
+        thinking = thinking_level(reasoning_effort)
         with self._inflight_lock:
             self._inflight = (conv, token)
         try:
-            result = conv.run(messages, tools, model, token)
+            result = conv.run(messages, tools, model, token, thinking)
             if result.get("guest"):
                 guest = registry.guest()
                 with self._inflight_lock:
                     self._inflight = (guest, token)
                 try:
-                    result = guest.run(messages, tools, model, token)
+                    result = guest.run(messages, tools, model, token, thinking)
                 finally:
                     guest.close()
         finally:
