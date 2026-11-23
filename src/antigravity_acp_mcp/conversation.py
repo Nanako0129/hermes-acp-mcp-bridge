@@ -32,7 +32,17 @@ from dataclasses import replace
 from typing import Any
 
 from .acp_connection import AcpConnection, AcpError
-from .matcher import TurnView, _text, canonical_args, classify, fingerprint, trailing_tool_round, view_after
+from .matcher import (
+    TurnView,
+    _text,
+    canonical_args,
+    classify,
+    explain_mismatch,
+    fingerprint,
+    project,
+    trailing_tool_round,
+    view_after,
+)
 from .parked_mcp import DEFAULT_DEADLINE_SECONDS, ParkedCall, ParkedMcpServer
 from .permission import PermissionGate
 from .session import AcpSession, new_session
@@ -126,7 +136,7 @@ def render_delta(delta: list[dict[str, Any]]) -> str:
 
 def _inflight_view(messages: list[dict[str, Any]]) -> TurnView:
     msgs = [m for m in messages if isinstance(m, dict)]
-    return TurnView(consumed=len(msgs), prefix_fp=fingerprint(msgs), live=True)
+    return TurnView(consumed=len(msgs), prefix_fp=fingerprint(msgs), live=True, seen=tuple(project(m) for m in msgs))
 
 
 class Conversation:
@@ -173,11 +183,17 @@ class Conversation:
         need_open = False
         with self.lock:
             decision = classify(messages, self.view, tools)
-            if decision.kind == "continue" and (tools_fp != self.tools_fp or (model or "") != self.model):
-                decision.kind = "replay"  # tool list and model are fixed per session
+            why = ""
+            if decision.kind == "continue" and tools_fp != self.tools_fp:
+                decision.kind, why = "replay", "tool list changed"  # fixed per session
+            elif decision.kind == "continue" and (model or "") != self.model:
+                decision.kind, why = "replay", "model changed"
+            elif decision.kind == "replay" and self.view.consumed:
+                why = ("session retired (" + self.retire_reason + ")" if self.view.retired
+                       else explain_mismatch(messages, list(self.view.seen)))
             if decision.kind == "resume_held" and self.session is None:
                 decision.kind = "replay"
-            logger.info("acp-mcp turn: %s", decision.kind)
+            logger.info("acp-mcp turn: %s%s", decision.kind, f" ({why})" if why else "")
             if decision.kind == "guest":
                 return {"guest": True}
             self.owner_token = token

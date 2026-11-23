@@ -32,6 +32,7 @@ class TurnView:
 
     consumed: int = 0  # number of Hermes messages represented in the session, incl. the pending assistant slot
     prefix_fp: str = ""  # fingerprint of project(messages[:consumed])
+    seen: tuple = ()  # project(messages[:consumed]) for diagnostics only (explain_mismatch); never logged raw
     handed_out: tuple[str, ...] = ()  # H: call ids returned to Hermes as tool_calls, not yet answered
     live: bool = False  # a prompt is in flight or parked
     retired: bool = False  # the session was cancelled and must never be prompted again
@@ -83,8 +84,9 @@ def fingerprint(messages: list[dict[str, Any]]) -> str:
 def view_after(messages: list[dict[str, Any]], *, handed_out: tuple[str, ...] = (), live: bool = False) -> TurnView:
     """The view once a prompt step ends: Hermes will append one assistant message (text, or tool_calls = H)."""
     pending = {"role": "assistant", "tool_calls": [{"id": i} for i in handed_out]}
-    seen = [*messages, pending]
-    return TurnView(consumed=len(seen), prefix_fp=fingerprint(seen), handed_out=handed_out, live=live)
+    seen = [*[m for m in messages if isinstance(m, dict)], pending]
+    return TurnView(consumed=len(seen), prefix_fp=fingerprint(seen), handed_out=handed_out, live=live,
+                    seen=tuple(project(m) for m in seen))
 
 
 def is_guest_shape(messages: list[dict[str, Any]], tools: list[Any] | None) -> bool:
@@ -121,6 +123,28 @@ def classify(messages: list[dict[str, Any]], view: TurnView | None, tools: list[
     if view.retired or view.handed_out:
         return Decision("replay", delta=delta)
     return Decision("continue", delta=delta)
+
+
+def explain_mismatch(messages: list[dict[str, Any]], seen: list[tuple]) -> str:
+    """Why the prefix no longer matches: position, role and which part differs. Never returns content."""
+    msgs = [m for m in messages if isinstance(m, dict)]
+    for i, old in enumerate(seen):
+        if i >= len(msgs):
+            return f"history shorter than seen ({len(msgs)} < {len(seen)})"
+        new = project(msgs[i])
+        if new != old:
+            if new[0] != old[0]:
+                return f"index {i}: role {old[0]} -> {new[0]}"
+            if new[0] == "assistant":
+                return f"index {i}: assistant tool-call ids differ ({len(old[1])} -> {len(new[1])} calls)"
+            if new[0] == "tool" and new[1] != old[1]:
+                return f"index {i}: tool_call_id differs"
+            old_t, new_t = old[-1], new[-1]
+            common = next((k for k in range(min(len(old_t), len(new_t))) if old_t[k] != new_t[k]),
+                          min(len(old_t), len(new_t)))
+            return (f"index {i}: {new[0]} text differs (len {len(old_t)} -> {len(new_t)}, "
+                    f"first difference at char {common})")
+    return "prefix matches"
 
 
 def canonical_args(arguments: Any) -> str:

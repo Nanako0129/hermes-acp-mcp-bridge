@@ -112,3 +112,14 @@ def test_trailing_tool_round_seed_and_canonical_args():
     assert trailing_tool_round([SYS, U1]) == set()
     assert trailing_tool_round([SYS, U1, asst_calls("c1"), tool("c1"), {"role": "user", "content": "new"}]) == set()
     assert canonical_args('{"b": 2, "a": 1}') == canonical_args({"a": 1, "b": 2})
+
+
+def test_explain_mismatch_reports_position_and_kind_without_content():
+    from antigravity_acp_mcp.matcher import explain_mismatch
+    base = [SYS, U1]
+    view = view_after(base)
+    edited = [SYS, {"role": "user", "content": "check a and b <memory-context>secret recall</memory-context>"},
+              {"role": "assistant", "content": "x"}, {"role": "user", "content": "next"}]
+    why = explain_mismatch(edited, list(view.seen))
+    assert why.startswith("index 1: user text differs") and "secret" not in why
+    assert classify(edited, view).kind == "replay"
