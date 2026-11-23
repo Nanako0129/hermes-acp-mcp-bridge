@@ -178,7 +178,10 @@ strings in planted files; "native execution" = canary in reply/updates/agy conve
   - Control (no disable key): the model tried `view_file` on the outside-cwd canary; agy's own workspace policy
     denied it ("access to that path is denied by the workspace access policy"). No `tool_call` update was emitted
     for that native call → the tripwire cannot rely on updates.
-  - `_meta.agy.disabledTools`: no visible effect (model reached for other tools).
+  - `_meta.agy.disabledTools`: the single read probe was inconclusive (the model reached for other tools). A later
+    `run_command` probe (2026-11-23, one prompt per key) showed this key DOES disable it: no permission request,
+    model says no shell tool is available, same as `_meta.antigravity.disabledTools`; with no key the same prompt
+    produced a `run_command` permission request. The matrix below was run with the `antigravity` key only.
   - `_meta.antigravity.disabledTools` (31 names): the model reports "no file-reading or shell-execution tools are
     available". **14/14 matrix probes** (read outside cwd, read inside cwd, list/search, write, run_command, URL
     fetch, web search) × (fresh, after an MCP `isError` with the guard wording) → **zero native executions**
