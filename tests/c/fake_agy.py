@@ -6,7 +6,8 @@ steps: {"call": {"name": str, "arguments": {...}}}  POST tools/call to the sessi
        {"echo_last": true}                            agent_message_chunk with the last tool answer text
        {"silent": seconds}                            sleep without any output
        {"stderr": str}                                one line on stderr
-       {"foreign": true}                              a tool_call update that is not ours (native tool)
+       {"foreign": true}                              a tool_call update that is not ours (native tool running)
+       {"refused_native": true}                       a native tool tried and refused (pending -> failed)
 Prompts are numbered across fake processes (counted from the log), so a respawned child continues the script.
 A prompt with no script entry answers "ok". session/cancel ends the in-flight prompt with stopReason cancelled.
 The log file gets one JSON line per event: {"ev": "prompt"|"new"|"answer"|"cancel", ...}.
@@ -84,6 +85,10 @@ def run_prompt(rid, sid, text, steps, token):
         elif step.get("foreign"):
             update(sid, {"sessionUpdate": "tool_call", "toolCallId": "native1", "status": "in_progress",
                          "title": "view_file"})
+        elif step.get("refused_native"):
+            update(sid, {"sessionUpdate": "tool_call", "toolCallId": "native0", "status": "pending",
+                         "title": "write_to_file"})
+            update(sid, {"sessionUpdate": "tool_call_update", "toolCallId": "native0", "status": "failed"})
         elif "stderr" in step:
             sys.stderr.write(step["stderr"] + "\n")
             sys.stderr.flush()

@@ -379,3 +379,12 @@ def test_child_spawned_after_close_is_reaped(tmp_path):
     while started and not started[0].exited and time.monotonic() < deadline:
         time.sleep(0.1)
     assert started and started[0].exited
+
+
+def test_refused_native_attempt_does_not_cancel_the_turn(tmp_path):
+    conv, log = make_conv(tmp_path, [[{"refused_native": True}, {"text": "fine"}]])
+    try:
+        assert conv.run([SYS, U1], TOOLS, "m")["text"] == "fine"
+        assert not any(e["ev"] == "cancel" for e in events(log))
+    finally:
+        conv.close()

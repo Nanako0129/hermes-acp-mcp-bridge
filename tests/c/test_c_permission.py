@@ -44,16 +44,21 @@ def test_never_picks_allow_always():
     assert gate().decide(request(meta(server="x"), kinds=("allow_always", "allow_once"))) == CANCELLED
 
 
-def test_tripwire_fires_for_unknown_tool_call_ids_only():
+def test_tripwire_fires_only_when_a_foreign_call_actually_runs():
     seen = []
     g = gate(on_foreign_tool_call=seen.append)
-    g.observe_update({"sessionUpdate": "tool_call", "toolCallId": "mine", "_meta": meta()})
-    g.observe_update({"sessionUpdate": "tool_call", "toolCallId": "mine", "_meta": meta()})
+    g.observe_update({"sessionUpdate": "tool_call", "toolCallId": "mine", "status": "in_progress", "_meta": meta()})
+    g.observe_update({"sessionUpdate": "tool_call_update", "toolCallId": "mine", "status": "completed"})
     g.observe_update({"sessionUpdate": "agent_message_chunk"})
     assert seen == []
-    native = {"sessionUpdate": "tool_call", "toolCallId": "n1", "title": "view_file"}
+    # a disabled native tool the model only tries: pending -> failed, never runs (live 2026-11-23)
+    g.observe_update({"sessionUpdate": "tool_call", "toolCallId": "n0", "status": "pending", "title": "write_to_file"})
+    g.observe_update({"sessionUpdate": "tool_call_update", "toolCallId": "n0", "status": "failed"})
+    assert seen == []
+    native = {"sessionUpdate": "tool_call", "toolCallId": "n1", "status": "in_progress", "title": "view_file"}
     g.observe_update(native)
-    g.observe_update({"sessionUpdate": "tool_call", "toolCallId": "n2", "_meta": meta(server="other")})
+    g.observe_update({"sessionUpdate": "tool_call_update", "toolCallId": "n2", "status": "completed",
+                      "_meta": meta(server="other")})
     assert seen[0] == native and len(seen) == 2
 
 
@@ -61,5 +66,5 @@ def test_permission_request_registers_the_call_as_ours():
     seen = []
     g = gate(on_foreign_tool_call=seen.append)
     g.decide(request(meta()))
-    g.observe_update({"sessionUpdate": "tool_call", "toolCallId": "t1"})
+    g.observe_update({"sessionUpdate": "tool_call", "toolCallId": "t1", "status": "in_progress"})
     assert seen == []

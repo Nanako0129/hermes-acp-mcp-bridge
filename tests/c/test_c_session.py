@@ -81,7 +81,8 @@ def test_prompt_updates_arrive_and_gate_answers_permissions(connect):
 
 def test_tripwire_runs_on_session_updates(connect):
     seen = []
-    conn = connect({"update_on_prompt": [{"sessionUpdate": "tool_call", "toolCallId": "n1", "title": "view_file"}]})
+    conn = connect({"update_on_prompt": [{"sessionUpdate": "tool_call", "toolCallId": "n1", "status": "in_progress",
+                                                    "title": "view_file"}]})
     session = new_session(conn, mcp_server=SERVER, gate=gate(on_foreign_tool_call=seen.append))
     session.prompt("hi", timeout=10)
     assert [u["toolCallId"] for u in seen] == ["n1"]
