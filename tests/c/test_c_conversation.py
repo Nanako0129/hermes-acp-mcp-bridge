@@ -75,7 +75,9 @@ def test_two_hop_turn_is_one_prompt_then_continue_sends_only_the_delta(tmp_path)
         assert [e["n"] for e in ev if e["ev"] == "prompt"] == [0]  # one ACP prompt for the whole turn
         assert [e["text"] for e in ev if e["ev"] == "answer"] == ["A", "B"]
         assert "SYS-MARK" in ev[1]["text"]  # system band in the prompt, no append
-        assert ev[0]["meta"] == {"antigravity": {"disabledTools": ev[0]["meta"]["antigravity"]["disabledTools"]}}
+        meta = ev[0]["meta"]["antigravity"]
+        assert set(meta) == {"disabledTools", "eagerMcpServers", "mcpMaxOutputBytes"}  # no systemPrompt append
+        assert meta["eagerMcpServers"][0].startswith("hermes-")
         msgs += [{"role": "assistant", "content": "both fine (as stored by Hermes)"},
                  {"role": "user", "content": "now c"}]
         r4 = conv.run(msgs, TOOLS, "m")

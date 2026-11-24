@@ -74,7 +74,18 @@ def _completion(result: dict, model: str) -> SimpleNamespace:
                               reasoning=result["reasoning"] or None, reasoning_content=result["reasoning"] or None,
                               reasoning_details=None)
     return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason=result["finish_reason"])],
-                           usage=None, model=model)
+                           usage=_usage(result.get("usage")), model=model)
+
+
+def _usage(u: dict | None) -> SimpleNamespace | None:
+    """agy's usage_update (input/output tokens, or context ``used``) as OpenAI-style usage; None when agy sent none."""
+    if not u:
+        return None
+    prompt = u.get("input_tokens", u.get("used"))
+    completion = u.get("output_tokens", 0)
+    if prompt is None:
+        return None
+    return SimpleNamespace(prompt_tokens=prompt, completion_tokens=completion, total_tokens=prompt + completion)
 
 
 class AntigravityAcpMcpClient:

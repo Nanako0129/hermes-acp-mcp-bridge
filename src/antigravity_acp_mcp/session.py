@@ -16,16 +16,25 @@ logger = logging.getLogger(__name__)
 # MEASURED on agy 1.5.2: ``_meta.antigravity.disabledTools`` disables every native tool in the S1 matrix
 # (``_meta.agy.disabledTools`` also disables run_command; only the antigravity key was matrix-tested).
 THINKING_LEVELS = ("low", "medium", "high", "xhigh")  # agy composite model-id suffixes, ascending
+# agy (1.5.2 source, mcp_servers.py) otherwise loads MCP tools lazily: the model sees only names and must read
+# brain/<id>/mcp/<server>/<tool>.json through a tool before using one (an extra model step per new tool, seen live).
+# It also spills MCP results above its inline limit to a file the model then has to read back.
+MCP_MAX_OUTPUT_BYTES = 256 * 1024
+EAGER_MCP = True  # module switch, so measurements can compare eager vs lazy loading
 NATIVE_TOOLS = [
-    "view_file", "view_file_outline", "view_code_item", "multimodal_view_file", "list_dir",
-    "list_directory", "find_by_name", "grep_search", "code_search", "codebase_search",
-    "write_to_file", "write_file", "edit_file", "replace_file_content", "multi_edit",
-    "delete_directory", "run_command", "read_terminal", "read_url_content", "read_url",
-    "search_web", "read_browser_page", "fetch_media", "generate_image", "execute_notebook",
-    "invoke_subagent", "manage_subagents", "manage_task", "run_workflow", "skill_search",
-    "trajectory_search",
-    # S1: with the above disabled the model reached for agy's MCP-resource tools (permission-gated).
-    "list_resources", "read_resource",
+    # 1.5.2 matrix list + list_resources/read_resource (S1) + the names agy 1.5.15 reports or embeds (PlanRelay R1);
+    # with this list the standalone server 1.5.2 passed the 14-probe canary matrix on the gateway host.
+    "view_file", "view_file_outline", "view_code_item", "multimodal_view_file", "list_dir", "list_directory",
+    "find_by_name", "grep_search", "code_search", "codebase_search", "write_to_file", "write_file",
+    "edit_file", "replace_file_content", "multi_edit", "delete_directory", "run_command", "read_terminal",
+    "read_url_content", "read_url", "search_web", "read_browser_page", "fetch_media", "generate_image",
+    "execute_notebook", "invoke_subagent", "manage_subagents", "manage_task", "run_workflow", "skill_search",
+    "trajectory_search", "list_resources", "read_resource", "read_file", "send_message", "schedule",
+    "define_subagent", "swarm", "ask_question", "browser_get_dom", "browser_get_network_request",
+    "browser_list_network_requests", "capture_browser_console_logs", "capture_browser_screenshot",
+    "list_browser_pages", "command_status", "search_in_file", "view_content_chunk", "read_board",
+    "manage_inbox", "notify_user", "list_permissions", "list_plugin_accounts", "search_marketplace",
+    "swarm_wait",
 ]  # fmt: skip
 
 # ACP stopReason -> OpenAI-style finish_reason ("cancelled" has no OpenAI equivalent).
@@ -71,7 +80,7 @@ class AcpSession:
         self.conn.cancel_session(self.session_id)
 
     def close(self) -> None:
-        self.conn.detach_session(self.session_id)
+        self.conn.close_session(self.session_id)
 
 
 def new_session(
@@ -88,7 +97,9 @@ def new_session(
         {
             "cwd": conn.cwd,
             "mcpServers": [mcp_server],
-            "_meta": {"antigravity": {"disabledTools": NATIVE_TOOLS}},
+            "_meta": {"antigravity": {"disabledTools": NATIVE_TOOLS,
+                                      **({"eagerMcpServers": [str(mcp_server.get("name") or "")]} if EAGER_MCP else {}),
+                                      "mcpMaxOutputBytes": MCP_MAX_OUTPUT_BYTES}},
         },
         timeout=60.0,
     )

@@ -244,6 +244,9 @@ _ACP_CHILD_ENV_ALLOW_EXACT = {
     "HERMES_REAL_HOME",
     "HERMES_HOME",
     "GEMINI_HOME",
+    # Local addition (not upstream): keeps the official server's credentials in a file under GEMINI_HOME instead of
+    # the user's login Keychain. A boolean switch, never credential material.
+    "AGY_ACP_FORCE_FILE_STORAGE",
     # POSIX locale categories, enumerated.  Rework round 2 admitted these via
     # an ``LC_`` wildcard; the maintainer P2 (historical reference) showed a
     # prefix silently authorizes arbitrary future names (``LC_API_TOKEN``).

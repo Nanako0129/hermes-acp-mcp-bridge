@@ -22,7 +22,24 @@ import urllib.request
 B = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
 LOG = B.get("log")
 lock = threading.Lock()
-state = {"sessions": {}, "n_prompt": 0, "inflight": None, "next_sid": 0}
+state = {"sessions": {}, "n_prompt": 0, "inflight": None, "next_sid": 0, "client_pending": {}}
+
+
+def _call_client(method, params, *, cancel_after=None):
+    rid = f"ag-{time.monotonic_ns()}"
+    ev = threading.Event()
+    slot = {"event": ev, "resp": None}
+    with lock:
+        state["client_pending"][rid] = slot
+    emit({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+    if cancel_after is not None:
+        time.sleep(float(cancel_after))
+        emit({"jsonrpc": "2.0", "method": "$/cancel_request", "params": {"requestId": rid}})
+    ev.wait(10.0)
+    with lock:
+        state["client_pending"].pop(rid, None)
+    log(ev="client_resp", method=method, resp=slot["resp"])
+    return slot["resp"]
 
 
 def log(**kw):
@@ -93,6 +110,11 @@ def run_prompt(rid, sid, text, steps, token):
         elif "stderr" in step:
             sys.stderr.write(step["stderr"] + "\n")
             sys.stderr.flush()
+        elif "usage" in step:
+            update(sid, {"sessionUpdate": "usage_update", **step["usage"]})
+        elif "client_req" in step:
+            cr = step["client_req"]
+            _call_client(cr["method"], cr.get("params") or {}, cancel_after=cr.get("cancel_after"))
     with lock:
         if token["done"]:
             return
@@ -104,10 +126,33 @@ def main():
     for line in sys.stdin:
         msg = json.loads(line)
         method, rid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
+        if method is None and rid is not None:
+            with lock:
+                slot = state["client_pending"].get(rid)
+            if slot is not None:
+                slot["resp"] = msg
+                slot["event"].set()
+            continue
         if method == "initialize":
+            if B.get("log_init"):
+                log(ev="init", client=params.get("clientInfo"), caps=params.get("clientCapabilities"))
+            acaps = {"mcpCapabilities": {"http": True}, "promptCapabilities": {"image": True}}
+            if B.get("session_close"):
+                acaps["sessionCapabilities"] = {"close": {}}
+            if B.get("load_session"):
+                acaps["loadSession"] = True
+            if B.get("session_resume"):
+                acaps.setdefault("sessionCapabilities", {})["resume"] = {}
             emit({"jsonrpc": "2.0", "id": rid, "result": {
-                "protocolVersion": 1, "agentCapabilities": {"mcpCapabilities": {"http": True},
-                                                            "promptCapabilities": {"image": True}}}})
+                "protocolVersion": 1, "agentInfo": {"name": "antigravity-acp", "version": B.get("version", "1.5.2")},
+                "agentCapabilities": acaps}})
+        elif method == "session/close":
+            log(ev="close_session", sid=params.get("sessionId"))
+            err_code = B.get("session_close_error")
+            if err_code is not None:
+                emit({"jsonrpc": "2.0", "id": rid, "error": {"code": int(err_code), "message": "not found"}})
+            else:
+                emit({"jsonrpc": "2.0", "id": rid, "result": {}})
         elif method == "session/new":
             state["next_sid"] += 1
             sid = f"s{state['next_sid']}"
@@ -122,7 +167,7 @@ def main():
             emit({"jsonrpc": "2.0", "id": rid, "result": {}})
         elif method == "session/prompt":
             sid = params["sessionId"]
-            text = params["prompt"][0]["text"]
+            text = "".join(b.get("text", "") for b in params["prompt"] if b.get("type") == "text")
             images = [b.get("mimeType") for b in params["prompt"] if b.get("type") == "image"]
             n = sum(1 for line in open(LOG) if '"ev": "prompt"' in line) if LOG and __import__("os").path.exists(LOG) else 0
             log(ev="prompt", sid=sid, n=n, text=text, images=images)

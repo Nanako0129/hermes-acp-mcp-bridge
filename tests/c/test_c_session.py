@@ -27,7 +27,8 @@ def test_session_new_declares_server_and_disables_native_tools(connect, caplog):
         session = new_session(conn, mcp_server=SERVER, gate=gate())
     (params,) = requests_of(conn, "session/new")
     assert params["mcpServers"] == [SERVER] and params["cwd"] == conn.cwd
-    assert params["_meta"] == {"antigravity": {"disabledTools": NATIVE_TOOLS}}
+    assert params["_meta"] == {"antigravity": {"disabledTools": NATIVE_TOOLS, "eagerMcpServers": ["hermes-deadbeef"],
+                                               "mcpMaxOutputBytes": 256 * 1024}}
     assert {"run_command", "view_file", "list_resources", "read_resource"} <= set(NATIVE_TOOLS)
     assert session.updates.get(timeout=5)["content"]["text"] == "early"  # buffered early update
     assert "BEARER-SENTINEL" not in caplog.text  # L1

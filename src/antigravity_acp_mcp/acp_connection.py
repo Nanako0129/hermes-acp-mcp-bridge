@@ -68,6 +68,7 @@ class AcpRpcError(AcpError):
     def __init__(self, code: Any, message: str) -> None:
         super().__init__(f"ACP error {code}: {message}")
         self.code = code
+        self.rpc_message = message
 
 
 class _Pending:
@@ -79,6 +80,16 @@ class _Pending:
         self.error: Exception | None = None
 
 
+_TERMINAL_METHODS = frozenset({
+    "terminal/create",
+    "terminal/output",
+    "terminal/wait_for_exit",
+    "terminal/kill",
+    "terminal/release",
+})
+ClientHandler = Callable[[dict[str, Any]], Any]
+
+
 class AcpConnection:
     def __init__(
         self,
@@ -87,6 +98,9 @@ class AcpConnection:
         cwd: str,
         *,
         mux_env: Mapping[str, str] | None = None,
+        client_info: Mapping[str, str] | None = None,
+        client_capabilities: Mapping[str, Any] | None = None,
+        client_handlers: Mapping[str, ClientHandler] | None = None,
     ) -> None:
         unknown = set(mux_env or ()) - MUX_ENV_KEYS
         if unknown:
@@ -94,6 +108,9 @@ class AcpConnection:
         self._argv = [command, *args]
         self._cwd = cwd
         self._mux_env = dict(mux_env or {})
+        self._client_info = dict(client_info) if client_info is not None else dict(INITIALIZE_PARAMS["clientInfo"])
+        self._client_capabilities_override = dict(client_capabilities) if client_capabilities is not None else None
+        self._client_handlers: dict[str, ClientHandler] = dict(client_handlers or {})
         self._proc: subprocess.Popen[bytes] | None = None
         self._lock = threading.RLock()  # guards the maps below; never held while calling out
         # Serialises session-update callbacks (order of chunks) without holding _lock. Callbacks must not block:
@@ -106,11 +123,19 @@ class AcpConnection:
         self._updates: dict[str, collections.deque[dict[str, Any]]] = {}
         self._sessions: dict[str, tuple[Callable[[dict[str, Any]], None], PermissionHandler]] = {}
         self._pending_perms: dict[str, list[Any]] = {}
+        self._active_client_reqs: dict[Any, threading.Event] = {}  # agent->client request_id -> cancelled
         self._stderr: collections.deque[str] = collections.deque(maxlen=_STDERR_KEEP_LINES)
         self._stderr_class: str | None = None
         self._exit_error: AcpProcessExit | None = None
         self._exited = threading.Event()
         self._threads: list[threading.Thread] = []
+        self.agent_info: dict[str, Any] = {}
+        self.agent_capabilities: dict[str, Any] = {}
+        self.supports_images = False
+        self.supports_load_session = False
+        self.supports_session_close = False
+        self.supports_session_resume = False
+        self.supports_http_mcp = False
 
     # -- lifecycle -----------------------------------------------------------------
 
@@ -132,12 +157,38 @@ class AcpConnection:
         for t in self._threads:
             t.start()
 
-    supports_images = False  # agentCapabilities.promptCapabilities.image from initialize
+    def _build_client_capabilities(self) -> dict[str, Any]:
+        # Per ACP v1 spec, only advertise fs/* or terminal when the corresponding client handlers are registered.
+        caps: dict[str, Any] = {
+            "fs": {
+                "readTextFile": "fs/read_text_file" in self._client_handlers,
+                "writeTextFile": "fs/write_text_file" in self._client_handlers,
+            },
+            "terminal": _TERMINAL_METHODS.issubset(self._client_handlers),
+        }
+        if self._client_capabilities_override is not None:
+            caps.update(self._client_capabilities_override)
+        return caps
 
     def initialize(self, timeout: float | None = 30.0) -> dict[str, Any]:
-        result = self.request("initialize", INITIALIZE_PARAMS, timeout=timeout)
-        caps = (result or {}).get("agentCapabilities") or {} if isinstance(result, dict) else {}
-        self.supports_images = bool((caps.get("promptCapabilities") or {}).get("image"))
+        params = {
+            "protocolVersion": INITIALIZE_PARAMS["protocolVersion"],
+            "clientCapabilities": self._build_client_capabilities(),
+            "clientInfo": self._client_info,
+        }
+        result = self.request("initialize", params, timeout=timeout)
+        res = result if isinstance(result, dict) else {}
+        self.agent_info = res.get("agentInfo") if isinstance(res.get("agentInfo"), dict) else {}
+        caps = res.get("agentCapabilities") if isinstance(res.get("agentCapabilities"), dict) else {}
+        self.agent_capabilities = caps
+        pcaps = caps.get("promptCapabilities") if isinstance(caps.get("promptCapabilities"), dict) else {}
+        mcaps = caps.get("mcpCapabilities") if isinstance(caps.get("mcpCapabilities"), dict) else {}
+        scaps = caps.get("sessionCapabilities") if isinstance(caps.get("sessionCapabilities"), dict) else {}
+        self.supports_images = bool(pcaps.get("image"))
+        self.supports_load_session = bool(caps.get("loadSession"))
+        self.supports_session_close = isinstance(scaps.get("close"), dict) or scaps.get("close") is True
+        self.supports_session_resume = isinstance(scaps.get("resume"), dict) or scaps.get("resume") is True
+        self.supports_http_mcp = bool(mcaps.get("http"))
         return result
 
     def close(self) -> None:
@@ -146,9 +197,10 @@ class AcpConnection:
         if proc is None:
             return
         try:
-            if proc.stdin:
-                proc.stdin.close()
-        except OSError:
+            with self._write_lock:
+                if proc.stdin and not proc.stdin.closed:
+                    proc.stdin.close()
+        except (OSError, ValueError):
             pass
         for stop in (None, proc.terminate, proc.kill):
             if stop:
@@ -189,7 +241,7 @@ class AcpConnection:
             self._pending[rid] = slot
         try:
             self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
-        except OSError:
+        except (OSError, ValueError):
             self._exited.wait(5.0)  # the reader builds the typed error
             with self._lock:
                 self._pending.pop(rid, None)
@@ -205,19 +257,21 @@ class AcpConnection:
     def notify(self, method: str, params: dict[str, Any]) -> None:
         try:
             self._send({"jsonrpc": "2.0", "method": method, "params": params})
-        except OSError:
+        except (OSError, ValueError):
             pass  # child gone: pending requests already fail with the typed exit error
 
     def respond(self, request_id: Any, result: Any) -> None:
         try:
             self._send({"jsonrpc": "2.0", "id": request_id, "result": result})
-        except OSError:
+        except (OSError, ValueError):
             pass
 
     def _send(self, message: dict[str, Any]) -> None:
         assert self._proc is not None and self._proc.stdin is not None
         line = (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
         with self._write_lock:
+            if self._proc.stdin.closed:
+                raise OSError("ACP child stdin closed")
             self._proc.stdin.write(line)
             self._proc.stdin.flush()
 
@@ -245,6 +299,21 @@ class AcpConnection:
         with self._lock:
             self._sessions.pop(session_id, None)
             self._updates.pop(session_id, None)
+            self._pending_perms.pop(session_id, None)
+
+    def close_session(self, session_id: str, timeout: float = 5.0) -> None:
+        """Close a session per ACP v1: call ``session/close`` only if advertised; treat -32002 as success."""
+        try:
+            if self.supports_session_close and not self.exited:
+                try:
+                    self.request("session/close", {"sessionId": session_id}, timeout=timeout)
+                except AcpRpcError as exc:
+                    if exc.code != -32002:  # ACP v1: unknown/already-closed session is idempotent success
+                        log.debug("session/close returned error %s for %s", exc.code, session_id)
+                except (AcpError, TimeoutError, OSError, ValueError):
+                    pass
+        finally:
+            self.detach_session(session_id)
 
     def cancel_session(self, session_id: str) -> None:
         """Answer every pending permission request ``cancelled``, then send session/cancel."""
@@ -292,9 +361,14 @@ class AcpConnection:
                     slot.result = msg.get("result")
                 slot.event.set()
         elif "id" in msg:
-            self._handle_agent_request(msg["id"], method, msg.get("params") or {})
+            raw_p = msg.get("params")
+            self._handle_agent_request(msg["id"], method, raw_p if isinstance(raw_p, dict) else {})
         elif method == "session/update":
-            self._handle_update(msg.get("params") or {})
+            raw_p = msg.get("params")
+            self._handle_update(raw_p if isinstance(raw_p, dict) else {})
+        elif method == "$/cancel_request":
+            raw_p = msg.get("params")
+            self._handle_cancel_request(raw_p if isinstance(raw_p, dict) else {})
 
     def _handle_update(self, params: dict[str, Any]) -> None:
         sid = str(params.get("sessionId") or "")
@@ -317,8 +391,66 @@ class AcpConnection:
         except Exception:  # noqa: BLE001 - a consumer bug must not kill the reader thread
             log.exception("session update consumer failed")
 
+    def _handle_cancel_request(self, params: dict[str, Any]) -> None:
+        """Handle incoming ACP ``$/cancel_request`` notification for pending permissions or client requests."""
+        req_id = params.get("requestId") if "requestId" in params else params.get("id")
+        if req_id is None:
+            return
+        cancel_perm = False
+        cancel_client = False
+        with self._lock:
+            for sid, rids in list(self._pending_perms.items()):
+                if req_id in rids:
+                    rids.remove(req_id)
+                    if not rids:
+                        self._pending_perms.pop(sid, None)
+                    cancel_perm = True
+                    break
+            ev = self._active_client_reqs.pop(req_id, None)
+            if ev is not None:
+                ev.set()
+                cancel_client = True
+        if cancel_perm:
+            self.respond(req_id, CANCELLED_OUTCOME)
+        if cancel_client:
+            self._send_error(req_id, -32800, "Request cancelled")
+
+    def _dispatch_client_handler(self, request_id: Any, method: str, handler: ClientHandler,
+                                 params: dict[str, Any]) -> None:
+        cancelled = threading.Event()
+        with self._lock:
+            self._active_client_reqs[request_id] = cancelled
+
+        def run() -> None:
+            try:
+                res = handler(params)
+            except AcpRpcError as exc:
+                code = exc.code if isinstance(exc.code, int) and not isinstance(exc.code, bool) else -32603
+                err: tuple[int, str] | None = (code, getattr(exc, "rpc_message", str(exc)))
+                res = None
+            except Exception:  # noqa: BLE001 - never kill worker or leave agent hanging
+                log.exception("ACP client handler %s failed", method)
+                err = (-32603, f"Internal error in {method}")
+                res = None
+            else:
+                err = None
+            with self._lock:
+                still_active = self._active_client_reqs.pop(request_id, None) is not None
+            if not still_active or cancelled.is_set():
+                return  # already answered -32800 by $/cancel_request
+            if err is not None:
+                self._send_error(request_id, err[0], err[1])
+            else:
+                self.respond(request_id, res if res is not None else {})
+
+        threading.Thread(target=run, name=f"acp-client-{method}", daemon=True).start()
+
     def _handle_agent_request(self, request_id: Any, method: str, params: dict[str, Any]) -> None:
         if method != "session/request_permission":
+            handler = self._client_handlers.get(method)
+            if handler is not None:
+                self._dispatch_client_handler(request_id, method, handler, params)
+                return
             self._send_error(request_id, -32601, f"Method not found: {method}")
             return
         sid = str(params.get("sessionId") or "")
@@ -342,7 +474,7 @@ class AcpConnection:
             self._send(
                 {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
             )
-        except OSError:
+        except (OSError, ValueError):
             pass
 
     def _on_exit(self) -> None:

@@ -1,5 +1,6 @@
 """Images (ACP image blocks, MCP image content) and thinking level (reasoning_effort -> agy) end to end."""
 
+import os
 import pytest
 from test_c_conversation import SYS, TOOLS, asst, events, make_conv
 
@@ -31,18 +32,22 @@ def test_replay_attaches_inline_images_numbered_and_deduped():
     msgs = [SYS, user_with(img(PNG_A)), {"role": "assistant", "content": "seen"},
             user_with(img(PNG_B, "image/jpeg"), img(PNG_A), {"type": "image_url", "image_url": {"url": "https://x/y.png"}})]
     blocks = render_replay(msgs)
-    text = blocks[0]["text"]
+    text = "".join(b["text"] for b in blocks if b["type"] == "text")
     assert "User: look\n[image #1]" in text  # history row
     assert "[image #2]\n[image #1]\n[image at https://x/y.png (not attached; use a vision tool" in text  # active row, same bytes = same number
     assert image_blocks(blocks) == [("image/png", PNG_A), ("image/jpeg", PNG_B)]
-    assert [b["text"] for b in blocks[1:] if b["type"] == "text"] == ["image #1:", "image #2:"]
+    # each image sits right after its first marker; the closing instruction stays the last block
+    assert [b["type"] for b in blocks] == ["text", "image", "text", "image", "text"]
+    assert blocks[0]["text"].endswith("[image #1]") and blocks[2]["text"].endswith("[image #2]")
+    assert blocks[-1]["text"].rstrip().endswith("respond to ACTIVE_REQUEST.")
 
 
 def test_replay_caps_attached_images_to_the_newest():
     datas = [f"SU1H{i:04d}" for i in range(MAX_PROMPT_IMAGES + 2)]
     blocks = render_replay([SYS, user_with(*[img(d) for d in datas])])
     assert [d for _, d in image_blocks(blocks)] == datas[2:]
-    assert "(image #1-#2 not attached: only the newest 8 are)" in blocks[0]["text"]
+    assert blocks[0]["text"].startswith("(image #1-#2 not attached: only the newest 8 are)")
+    assert blocks[-1]["text"].rstrip().endswith("respond to ACTIVE_REQUEST.")
 
 
 def test_delta_carries_its_images_and_text_only_stays_one_block():
@@ -150,7 +155,7 @@ def test_prompt_keeps_images_when_the_agent_declares_them(connect):
     session = new_session(conn, mcp_server=SERVER, gate=PermissionGate("hermes-deadbeef", set()))
     session.prompt(render_delta([user_with(img(PNG_A))]), timeout=10)
     (params,) = [m["params"] for m in dump(conn)["log"] if m.get("method") == "session/prompt"]
-    assert [b["type"] for b in params["prompt"]] == ["text", "text", "image"]
+    assert [b["type"] for b in params["prompt"]] == ["text", "image"]
 
 
 def test_nearest_level_both_directions(connect):
@@ -212,5 +217,112 @@ def test_second_degenerate_reply_is_returned_as_is(tmp_path):
     try:
         assert conv.run([SYS, {"role": "user", "content": "q"}], TOOLS, "m")["text"] == "}"
         assert len([e for e in events(log) if e["ev"] == "prompt"]) == 2
+    finally:
+        conv.close()
+
+
+def test_replays_of_one_conversation_share_a_byte_identical_prefix(tmp_path):
+    conv, log = make_conv(tmp_path, [[{"call": {"name": "fetch", "arguments": {"k": "a"}}}], [{"text": "x"}],
+                                     [{"text": "y"}]])
+    try:
+        msgs = [SYS, {"role": "user", "content": "q"}]
+        r1 = conv.run(msgs, TOOLS, "m")
+        msgs += [asst(r1["tool_calls"]), {"role": "tool", "tool_call_id": r1["tool_calls"][0].id, "content": "A"}]
+        conv.cancel()  # retire: each next request replays on a fresh session
+        conv.run(msgs, TOOLS, "m")
+        conv.cancel()
+        conv.run(msgs, TOOLS, "m")
+        prompts = [e["text"] for e in events(log) if e["ev"] == "prompt"]
+        assert len(prompts) == 3 and prompts[1].count(conv.fence) == 2
+        # identical through the end of the fenced tool output, not just the system band
+        end = prompts[1].rindex(conv.fence) + len(conv.fence)
+        assert prompts[2][:end] == prompts[1][:end]
+    finally:
+        conv.close()
+
+
+@pytest.mark.parametrize("literal_row", [
+    {"role": "user", "content": "what is [image #1]?"},
+    {"role": "assistant", "content": "In [image #1] I see a cat"},
+])
+def test_typed_marker_text_never_decides_where_an_image_lands(literal_row):
+    msgs = [SYS, literal_row, {"role": "user", "content": "ok"}, user_with(img(PNG_A))]
+    blocks = render_replay(msgs)
+    idx = next(i for i, b in enumerate(blocks) if b["type"] == "image")
+    before = blocks[idx - 1]["text"]
+    assert "<ACTIVE_REQUEST>" in before and before.endswith("[image #1]")  # placed in the active request
+    assert "\x1e" not in "".join(b.get("text", "") for b in blocks)  # no sentinel leaks into the prompt
+
+
+def test_marker_text_in_tool_output_does_not_move_the_image():
+    msgs = [SYS, user_with(img(PNG_A)), {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "c1", "type": "function", "function": {"name": "fetch", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "page says [image #1]"}]
+    blocks = render_replay(msgs)
+    idx = next(i for i, b in enumerate(blocks) if b["type"] == "image")
+    assert "<ACTIVE_REQUEST>" in blocks[idx - 1]["text"] and "page says" not in blocks[idx - 1]["text"]
+
+
+
+def test_replay_keeps_the_active_copy_of_a_repeated_system_message_full():
+    big = "<system-message>\n" + "rule " * 60 + "\n</system-message>"
+    msgs = [SYS, {"role": "user", "content": "first\n" + big}, {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "second\n" + big}]
+    text = "".join(b["text"] for b in render_replay(msgs, seen_sys=set()) if b["type"] == "text")
+    active = text.split("<ACTIVE_REQUEST>")[1].split("</ACTIVE_REQUEST>")[0]
+    history = text.split("<HISTORICAL_CONTEXT>")[1].split("</HISTORICAL_CONTEXT>")[0]
+    assert "rule rule" in active and "rule rule" not in history
+    assert "repeated in full later in this prompt" in history
+
+
+def test_usage_update_reaches_the_openai_completion(tmp_path):
+    from antigravity_acp_mcp.client import _completion
+    conv, _ = make_conv(tmp_path, [[{"usage": {"used": 1200, "size": 1000000, "inputTokens": 900,
+                                               "outputTokens": 40}}, {"text": "hi"}]])
+    try:
+        r = conv.run([SYS, {"role": "user", "content": "q"}], TOOLS, "m")
+        u = _completion(r, "m").usage
+        assert (u.prompt_tokens, u.completion_tokens, u.total_tokens) == (900, 40, 940)
+    finally:
+        conv.close()
+
+
+def test_caller_cwd_is_never_deleted(tmp_path):
+    keep = tmp_path / "workspace"
+    keep.mkdir()
+    conv, _ = make_conv(tmp_path, [[{"text": "x"}]], cwd=str(keep))
+    conv.run([SYS, {"role": "user", "content": "q"}], TOOLS, "m")
+    conv.close()
+    assert keep.is_dir()
+    handed = tmp_path / "pool-temp"
+    handed.mkdir()
+    conv, _ = make_conv(tmp_path, [[{"text": "x"}]], cwd=str(handed), owns_cwd=True)
+    conv.close()
+    assert not handed.exists()  # ownership handed over explicitly
+    own, _ = make_conv(tmp_path, [[{"text": "x"}]])
+    own_dir = own.cwd
+    own.close()
+    assert not os.path.exists(own_dir)
+
+
+def test_duplicate_tool_result_request_is_refused_and_the_running_step_survives(tmp_path):
+    import threading
+    import time
+
+    from antigravity_acp_mcp.conversation import ProviderError
+    conv, _ = make_conv(tmp_path, [[{"call": {"name": "fetch", "arguments": {"k": "a"}}}, {"silent": 1.0},
+                                    {"text": "done"}]])
+    try:
+        msgs = [SYS, {"role": "user", "content": "q"}]
+        r1 = conv.run(msgs, TOOLS, "m")
+        msgs += [asst(r1["tool_calls"]), {"role": "tool", "tool_call_id": r1["tool_calls"][0].id, "content": "A"}]
+        out = []
+        t = threading.Thread(target=lambda: out.append(conv.run(msgs, TOOLS, "m")))
+        t.start()
+        time.sleep(0.3)
+        with pytest.raises(ProviderError, match="duplicate"):
+            conv.run(msgs, TOOLS, "m")
+        t.join(20)
+        assert out and out[0]["text"] == "done"
     finally:
         conv.close()
