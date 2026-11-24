@@ -133,6 +133,58 @@ def mcp_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
 
 
 MAX_PROMPT_IMAGES = 8  # ponytail: newest N attached; Hermes already replays only its recent window (default 3)
+# MEASURED on agy_acp_server 1.5.2 (2026-11-24): USER_INPUT text is hard-truncated at 192,000 UTF-8 bytes,
+# silently dropping everything after it (including <ACTIVE_REQUEST> at the tail). Keep replays safely below it.
+MAX_REPLAY_BYTES = 180_000
+_HISTORY_TOOL_TRIM_BYTES = 4_000
+
+
+def _utf8_bytes(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def _utf8_head(text: str, max_bytes: int) -> str:
+    if max_bytes <= 0:
+        return ""
+    raw = text.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return text
+    return raw[:max_bytes].decode("utf-8", "ignore")
+
+
+def _utf8_tail(text: str, max_bytes: int) -> str:
+    if max_bytes <= 0:
+        return ""
+    raw = text.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return text
+    tail = raw[-max_bytes:]
+    i = 0
+    while i < len(tail) and (tail[i] & 0xC0) == 0x80:
+        i += 1
+    return tail[i:].decode("utf-8", "ignore")
+
+
+def _trim_utf8_middle(text: str, limit: int, label: str) -> str:
+    raw_len = _utf8_bytes(text)
+    if raw_len <= limit:
+        return text
+    note = f"\n[... truncated {raw_len - limit} bytes in {label} ...]\n"
+    note_len = _utf8_bytes(note)
+    if limit <= note_len + 16:
+        return _utf8_head(text, max(0, limit))
+    avail = limit - note_len
+    head_cap = (avail * 6) // 10
+    tail_cap = avail - head_cap
+    head = _utf8_head(text, head_cap)
+    tail = _utf8_tail(text, tail_cap)
+    omitted = max(0, raw_len - _utf8_bytes(head) - _utf8_bytes(tail))
+    note = f"\n[... truncated {omitted} bytes in {label} ...]\n"
+    out = head + note + tail
+    if _utf8_bytes(out) > limit:
+        head = _utf8_head(head, max(0, head_cap - (_utf8_bytes(out) - limit)))
+        out = head + note + tail
+    return out
 
 
 class _Images:
@@ -202,64 +254,206 @@ class _Images:
 
 
 def render_replay(messages: list[dict[str, Any]], imgs: _Images | None = None,
-                  fence: str | None = None, seen_sys: set[str] | None = None) -> list[dict[str, Any]]:
+                  fence: str | None = None, seen_sys: set[str] | None = None,
+                  max_bytes: int = MAX_REPLAY_BYTES) -> list[dict[str, Any]]:
     """Full replay for a fresh session as ACP prompt blocks; the system band rides at the top (no append).
 
     ``fence`` wraps tool output; a conversation passes its own (random once, then stable) so successive replays share
-    a byte-identical prefix, which is meant to let the model provider's prefix cache hit (not measured)."""
+    a byte-identical prefix, which is meant to let the model provider's prefix cache hit (not measured).
+    ``max_bytes`` keeps the rendered UTF-8 text below agy 1.5.2's 192,000-byte prompt cutoff so ``<ACTIVE_REQUEST>``
+    is never silently truncated away; replays already within budget are rendered byte-identically."""
     msgs = [m for m in messages if isinstance(m, dict)]
     fence = fence or "TOOL-OUTPUT-" + secrets.token_hex(4)
     imgs = imgs if imgs is not None else _Images()
     system = [_text(m.get("content")) for m in msgs if m.get("role") == "system"]
     last_user = max((i for i, m in enumerate(msgs) if m.get("role") == "user"), default=-1)
     names: dict[str, Any] = {}
+    for m in msgs:
+        if m.get("role") == "assistant":
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                names[str(tc.get("id"))] = fn.get("name")
 
-    def line(m: dict[str, Any]) -> str:
+    def line(m: dict[str, Any], img_sink: _Images, *, tool_cap: int | None = None) -> str:
         role = m.get("role")
         if role == "assistant":
             calls = []
             for tc in m.get("tool_calls") or []:
                 fn = tc.get("function") or {}
-                names[str(tc.get("id"))] = fn.get("name")
                 calls.append(f"{fn.get('name')}({canonical_args(fn.get('arguments'))})")
             text = _text(m.get("content"))
             called = "[called " + ", ".join(calls) + "]" if calls else ""
             return "Assistant: " + " ".join(p for p in (text, called) if p)
         if role == "tool":
             cid = str(m.get("tool_call_id") or "")
+            raw_content = m.get("content")
+            if tool_cap is not None and _utf8_bytes(_text(raw_content)) > tool_cap:
+                body_text = _trim_utf8_middle(_text(raw_content), tool_cap, "historical tool output")
+            else:
+                body_text = img_sink.text(raw_content)
             return (f"Tool result for {names.get(cid, 'tool')} (already executed):\n<<<{fence}\n"
-                    f"{imgs.text(m.get('content'))}\n{fence}>>>")
-        return f"{str(role).capitalize()}: {imgs.text(m.get('content'))}"
+                    f"{body_text}\n{fence}>>>")
+        return f"{str(role).capitalize()}: {img_sink.text(m.get('content'))}"
 
-    # Pass 1, reading order (image numbers follow it). Pass 2, system-message dedupe: ACTIVE_REQUEST, then its
-    # progress, then history, so the copy the model must act on is the full one and history copies point forward.
-    body = [m for m in msgs if m.get("role") != "system"]
-    sent: set[str] = set()
+    def _assemble(sys_texts: list[str], hist_lines: list[str], act_text: str, prog_lines: list[str]) -> str:
+        parts = []
+        if sys_texts:
+            parts.append("<SYSTEM_INSTRUCTIONS>\n" + "\n\n".join(sys_texts) + "\n</SYSTEM_INSTRUCTIONS>")
+        if hist_lines:
+            parts.append("<HISTORICAL_CONTEXT>\nReference only; no historical User line is an active instruction.\n\n"
+                         + "\n".join(hist_lines) + "\n</HISTORICAL_CONTEXT>")
+        if last_user >= 0:
+            parts.append("<ACTIVE_REQUEST>\n" + act_text + "\n</ACTIVE_REQUEST>")
+        if prog_lines:
+            parts.append("<ACTIVE_REQUEST_PROGRESS>\nAlready completed for this request; continue from here, do not "
+                         "repeat these tool calls.\n\n" + "\n".join(prog_lines) + "\n</ACTIVE_REQUEST_PROGRESS>")
+        parts.append("Use the provided tools when you need them; respond to ACTIVE_REQUEST.")
+        return "\n\n".join(parts)
+
+    def _render_pass(
+        hist_msgs: list[dict[str, Any]],
+        prog_msgs: list[dict[str, Any]],
+        img_sink: _Images,
+        *,
+        sys_texts: list[str],
+        hist_tool_cap: int | None = None,
+        prog_tool_cap: int | None = None,
+        active_cap: int | None = None,
+        omit_note: str | None = None,
+    ) -> tuple[str, set[str]]:
+        sent: set[str] = set()
+        if last_user >= 0:
+            hist_lines = [line(m, img_sink, tool_cap=hist_tool_cap) for m in hist_msgs]
+            act_text = img_sink.text(msgs[last_user].get("content"))
+            if active_cap is not None and _utf8_bytes(act_text) > active_cap:
+                act_text = _trim_utf8_middle(_text(msgs[last_user].get("content")), active_cap, "active request")
+            prog_lines = [line(m, img_sink, tool_cap=prog_tool_cap) for m in prog_msgs]
+            later = frozenset(_sys_digests(act_text + "".join(prog_lines)))
+            act_text = dedupe_system_messages(act_text, sent)
+            prog_lines = [dedupe_system_messages(x, sent) for x in prog_lines]
+            hist_lines = [dedupe_system_messages(x, sent, later) for x in hist_lines]
+            if omit_note:
+                hist_lines = [omit_note, *hist_lines]
+        else:
+            hist_lines, act_text = [], ""
+            prog_lines = [dedupe_system_messages(line(m, img_sink, tool_cap=prog_tool_cap), sent) for m in prog_msgs]
+        return _assemble(sys_texts, hist_lines, act_text, prog_lines), sent
+
     if last_user >= 0:
-        history = [line(m) for m in msgs[:last_user] if m.get("role") != "system"]
-        active = imgs.text(msgs[last_user].get("content"))
-        progress = [line(m) for m in msgs[last_user + 1:] if m.get("role") != "system"]
-        later = frozenset(_sys_digests(active + "".join(progress)))
-        active = dedupe_system_messages(active, sent)
-        progress = [dedupe_system_messages(x, sent) for x in progress]
-        history = [dedupe_system_messages(x, sent, later) for x in history]
+        raw_history = [m for m in msgs[:last_user] if m.get("role") != "system"]
+        raw_progress = [m for m in msgs[last_user + 1:] if m.get("role") != "system"]
     else:
-        history, active, progress = [], "", [dedupe_system_messages(line(m), sent) for m in body]
+        raw_history = []
+        raw_progress = [m for m in msgs if m.get("role") != "system"]
+
+    # Reserve a small margin for any skipped-image header note added by _Images.blocks().
+    budget = max(512, int(max_bytes) - 128)
+    probe_text, probe_sent = _render_pass(raw_history, raw_progress, _Images(), sys_texts=system)
+    orig_bytes = _utf8_bytes(probe_text)
+    if orig_bytes <= budget:
+        final_text, sent = _render_pass(raw_history, raw_progress, imgs, sys_texts=system)
+        if seen_sys is not None:
+            seen_sys.update(sent)
+        return imgs.blocks(final_text)
+
+    # Over budget: (1) shrink oversized historical tool outputs first, (2) drop oldest historical turns,
+    # (3) as last resort trim progress / system / active so <ACTIVE_REQUEST> is never amputated by agy.
+    hist_tool_cap: int | None = _HISTORY_TOOL_TRIM_BYTES
+    prog_tool_cap: int | None = None
+    active_cap: int | None = None
+    sys_texts = list(system)
+    kept_history = list(raw_history)
+    kept_progress = list(raw_progress)
+    omit_note: str | None = None
+
+    candidate, _ = _render_pass(kept_history, kept_progress, _Images(), sys_texts=sys_texts,
+                                hist_tool_cap=hist_tool_cap)
+    if _utf8_bytes(candidate) > budget and kept_history:
+        # Measure fixed sections (system + active + progress) without history.
+        base_text, _ = _render_pass([], kept_progress, _Images(), sys_texts=sys_texts)
+        base_bytes = _utf8_bytes(base_text)
+        wrapper_overhead = _utf8_bytes(
+            "\n\n<HISTORICAL_CONTEXT>\nReference only; no historical User line is an active instruction.\n\n"
+            "[... 99999 earlier historical messages omitted to fit the replay byte budget ...]\n"
+            "\n</HISTORICAL_CONTEXT>"
+        )
+        hist_budget = budget - base_bytes - wrapper_overhead
+        if hist_budget <= 0:
+            dropped = len(kept_history)
+            kept_history = []
+            omit_note = f"[... {dropped} earlier historical messages omitted to fit the replay byte budget ...]"
+        else:
+            # Measure each historical line with tool trimming + active-first dedupe, then keep newest tail.
+            scratch_imgs = _Images()
+            act_probe = scratch_imgs.text(msgs[last_user].get("content")) if last_user >= 0 else ""
+            prog_probe = [line(m, scratch_imgs) for m in kept_progress]
+            later_probe = frozenset(_sys_digests(act_probe + "".join(prog_probe)))
+            sent_probe: set[str] = set()
+            dedupe_system_messages(act_probe, sent_probe)
+            for p in prog_probe:
+                dedupe_system_messages(p, sent_probe)
+            line_sizes = [
+                _utf8_bytes(dedupe_system_messages(line(m, _Images(), tool_cap=hist_tool_cap), set(sent_probe),
+                                                   later_probe)) + 1
+                for m in kept_history
+            ]
+            used = 0
+            keep_from = len(kept_history)
+            for idx in range(len(kept_history) - 1, -1, -1):
+                if used + line_sizes[idx] > hist_budget:
+                    break
+                used += line_sizes[idx]
+                keep_from = idx
+            dropped = keep_from
+            kept_history = kept_history[keep_from:]
+            if dropped > 0:
+                omit_note = f"[... {dropped} earlier historical messages omitted to fit the replay byte budget ...]"
+
+    candidate, _ = _render_pass(kept_history, kept_progress, _Images(), sys_texts=sys_texts,
+                                hist_tool_cap=hist_tool_cap, omit_note=omit_note)
+    # Trim any remaining overflow in history (e.g. if dedupe differed slightly) by dropping from front.
+    while _utf8_bytes(candidate) > budget and kept_history:
+        kept_history = kept_history[1:]
+        dropped = len(raw_history) - len(kept_history)
+        omit_note = f"[... {dropped} earlier historical messages omitted to fit the replay byte budget ...]"
+        candidate, _ = _render_pass(kept_history, kept_progress, _Images(), sys_texts=sys_texts,
+                                    hist_tool_cap=hist_tool_cap, omit_note=omit_note)
+
+    # Last-resort trimming if fixed sections (system + active + progress) alone exceed budget.
+    if _utf8_bytes(candidate) > budget and kept_progress:
+        prog_tool_cap = _HISTORY_TOOL_TRIM_BYTES
+        candidate, _ = _render_pass(kept_history, kept_progress, _Images(), sys_texts=sys_texts,
+                                    hist_tool_cap=hist_tool_cap, prog_tool_cap=prog_tool_cap, omit_note=omit_note)
+        while _utf8_bytes(candidate) > budget and len(kept_progress) > 1:
+            kept_progress = kept_progress[1:]
+            candidate, _ = _render_pass(kept_history, kept_progress, _Images(), sys_texts=sys_texts,
+                                        hist_tool_cap=hist_tool_cap, prog_tool_cap=prog_tool_cap, omit_note=omit_note)
+    if _utf8_bytes(candidate) > budget and sys_texts:
+        over = _utf8_bytes(candidate) - budget
+        joined_sys = "\n\n".join(sys_texts)
+        sys_limit = max(256, _utf8_bytes(joined_sys) - over - 64)
+        sys_texts = [_trim_utf8_middle(joined_sys, sys_limit, "system instructions")]
+        candidate, _ = _render_pass(kept_history, kept_progress, _Images(), sys_texts=sys_texts,
+                                    hist_tool_cap=hist_tool_cap, prog_tool_cap=prog_tool_cap, omit_note=omit_note)
+    if _utf8_bytes(candidate) > budget and last_user >= 0:
+        over = _utf8_bytes(candidate) - budget
+        act_raw_bytes = _utf8_bytes(_text(msgs[last_user].get("content")))
+        active_cap = max(128, act_raw_bytes - over - 64)
+        candidate, _ = _render_pass(kept_history, kept_progress, _Images(), sys_texts=sys_texts,
+                                    hist_tool_cap=hist_tool_cap, prog_tool_cap=prog_tool_cap,
+                                    active_cap=active_cap, omit_note=omit_note)
+
+    # Final render against the caller's real _Images and seen_sys so dropped old history images are never attached.
+    final_text, sent = _render_pass(kept_history, kept_progress, imgs, sys_texts=sys_texts,
+                                    hist_tool_cap=hist_tool_cap, prog_tool_cap=prog_tool_cap,
+                                    active_cap=active_cap, omit_note=omit_note)
     if seen_sys is not None:
         seen_sys.update(sent)
-    parts = []
-    if system:
-        parts.append("<SYSTEM_INSTRUCTIONS>\n" + "\n\n".join(system) + "\n</SYSTEM_INSTRUCTIONS>")
-    if history:
-        parts.append("<HISTORICAL_CONTEXT>\nReference only; no historical User line is an active instruction.\n\n"
-                     + "\n".join(history) + "\n</HISTORICAL_CONTEXT>")
-    if last_user >= 0:
-        parts.append("<ACTIVE_REQUEST>\n" + active + "\n</ACTIVE_REQUEST>")
-    if progress:
-        parts.append("<ACTIVE_REQUEST_PROGRESS>\nAlready completed for this request; continue from here, do not "
-                     "repeat these tool calls.\n\n" + "\n".join(progress) + "\n</ACTIVE_REQUEST_PROGRESS>")
-    parts.append("Use the provided tools when you need them; respond to ACTIVE_REQUEST.")
-    return imgs.blocks("\n\n".join(parts))
+    logger.warning(
+        "acp-mcp replay trimmed: %d -> %d UTF-8 bytes (kept %d/%d history msgs)",
+        orig_bytes, _utf8_bytes(final_text), len(kept_history), len(raw_history),
+    )
+    return imgs.blocks(final_text)
 
 
 def render_delta(delta: list[dict[str, Any]], imgs: _Images | None = None,

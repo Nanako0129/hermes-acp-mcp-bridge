@@ -326,3 +326,60 @@ def test_duplicate_tool_result_request_is_refused_and_the_running_step_survives(
         assert out and out[0]["text"] == "done"
     finally:
         conv.close()
+
+
+def test_replay_budget_preserves_active_request_and_drops_old_history_and_images():
+    from antigravity_acp_mcp.conversation import MAX_REPLAY_BYTES
+    sys_msg = {"role": "system", "content": "sys " * 2000}
+    msgs = [sys_msg, user_with(img(PNG_A)), {"role": "assistant", "content": "old screenshot reply"}]
+    for i in range(40):
+        msgs.append({"role": "user", "content": f"old turn {i} " + ("漢" * 1000)})
+        msgs.append({"role": "assistant", "content": "", "tool_calls": [
+            {"id": f"c{i}", "type": "function", "function": {"name": "fetch", "arguments": "{}"}}]})
+        msgs.append({"role": "tool", "tool_call_id": f"c{i}", "content": f"tool-{i}-" + ("X" * 10000)})
+        msgs.append({"role": "assistant", "content": f"done {i}"})
+    msgs.append(user_with(img(PNG_B)))
+    msgs.append({"role": "assistant", "content": "recent turn reply"})
+    msgs.append({"role": "user", "content": "最新的實際問題：每日提醒每次都是真的對話嗎？"})
+    blocks = render_replay(msgs)
+    full_text = "".join(b["text"] for b in blocks if b["type"] == "text")
+    assert len(full_text.encode("utf-8")) <= MAX_REPLAY_BYTES
+    assert "<ACTIVE_REQUEST>\n最新的實際問題：每日提醒每次都是真的對話嗎？\n</ACTIVE_REQUEST>" in full_text
+    assert full_text.endswith("Use the provided tools when you need them; respond to ACTIVE_REQUEST.")
+    assert "recent turn reply" in full_text
+    assert "earlier historical messages omitted" in full_text
+    # Dropped old screenshot PNG_A must NOT be attached; surviving recent PNG_B MUST be attached as #1.
+    assert image_blocks(blocks) == [("image/png", PNG_B)]
+    assert "[image #1]" in full_text and "[image #2]" not in full_text
+
+
+def test_replay_budget_shrinks_historical_tool_outputs_before_dropping_turns():
+    msgs = [
+        SYS,
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "fetch", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "HEAD-" + ("Z" * 20_000) + "-TAIL"},
+        {"role": "assistant", "content": "first answer"},
+        {"role": "user", "content": "second question"},
+    ]
+    blocks = render_replay(msgs, max_bytes=12_000)
+    full_text = "".join(b["text"] for b in blocks if b["type"] == "text")
+    assert len(full_text.encode("utf-8")) <= 12_000
+    assert "first question" in full_text and "first answer" in full_text
+    assert "HEAD-" in full_text and "-TAIL" in full_text
+    assert "truncated" in full_text and "earlier historical messages omitted" not in full_text
+    assert "<ACTIVE_REQUEST>\nsecond question\n</ACTIVE_REQUEST>" in full_text
+
+
+def test_replay_budget_handles_oversized_system_and_cjk_safely():
+    msgs = [
+        {"role": "system", "content": "系統規則：" + ("繁體中文測試" * 1000)},
+        {"role": "user", "content": "歷史訊息" * 500},
+        {"role": "assistant", "content": "歷史回覆" * 500},
+        {"role": "user", "content": "最後一個真正的問題"},
+    ]
+    blocks = render_replay(msgs, max_bytes=4_000)
+    full_text = "".join(b["text"] for b in blocks if b["type"] == "text")
+    assert len(full_text.encode("utf-8")) <= 4_000
+    assert "<ACTIVE_REQUEST>\n最後一個真正的問題\n</ACTIVE_REQUEST>" in full_text
