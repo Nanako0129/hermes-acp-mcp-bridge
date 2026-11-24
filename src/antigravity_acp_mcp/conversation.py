@@ -253,6 +253,26 @@ class _Images:
         return out
 
 
+def _trim_content_with_images(content: Any, img_sink: _Images, cap: int, label: str) -> str:
+    """Trim message content to at most ``cap`` UTF-8 bytes without leaving orphan image registrations."""
+    if not isinstance(content, list) or not images(content):
+        return _trim_utf8_middle(_text(content), cap, label)
+    img_parts = [p for p in content if isinstance(p, dict) and p.get("type") in IMAGE_PART_TYPES and images([p])]
+    # Each sentinel is ~22 bytes (and renders to a shorter "[image #n]" in blocks()); reserve 24 bytes per image.
+    reserve = len(img_parts) * 24
+    if cap <= reserve:
+        return _trim_utf8_middle(_text(content), cap, label)
+    markers = [img_sink.text([p]) for p in img_parts]
+    marker_block = "\n".join(markers)
+    text_budget = cap - _utf8_bytes(marker_block) - 1
+    non_img = [p for p in content if not (isinstance(p, dict) and p.get("type") in IMAGE_PART_TYPES and images([p]))]
+    plain = img_sink.text(non_img) if non_img else ""
+    if not plain:
+        return marker_block
+    trimmed = _trim_utf8_middle(plain, max(0, text_budget), label)
+    return f"{trimmed}\n{marker_block}" if trimmed else marker_block
+
+
 def render_replay(messages: list[dict[str, Any]], imgs: _Images | None = None,
                   fence: str | None = None, seen_sys: set[str] | None = None,
                   max_bytes: int = MAX_REPLAY_BYTES) -> list[dict[str, Any]]:
@@ -274,7 +294,8 @@ def render_replay(messages: list[dict[str, Any]], imgs: _Images | None = None,
                 fn = tc.get("function") or {}
                 names[str(tc.get("id"))] = fn.get("name")
 
-    def line(m: dict[str, Any], img_sink: _Images, *, tool_cap: int | None = None) -> str:
+    def line(m: dict[str, Any], img_sink: _Images, *, tool_cap: int | None = None,
+             line_cap: int | None = None) -> str:
         role = m.get("role")
         if role == "assistant":
             calls = []
@@ -283,17 +304,36 @@ def render_replay(messages: list[dict[str, Any]], imgs: _Images | None = None,
                 calls.append(f"{fn.get('name')}({canonical_args(fn.get('arguments'))})")
             text = _text(m.get("content"))
             called = "[called " + ", ".join(calls) + "]" if calls else ""
-            return "Assistant: " + " ".join(p for p in (text, called) if p)
+            out = "Assistant: " + " ".join(p for p in (text, called) if p)
+            if line_cap is not None and _utf8_bytes(out) > line_cap:
+                return _trim_utf8_middle(out, line_cap, "assistant message")
+            return out
         if role == "tool":
             cid = str(m.get("tool_call_id") or "")
             raw_content = m.get("content")
-            if tool_cap is not None and _utf8_bytes(_text(raw_content)) > tool_cap:
-                body_text = _trim_utf8_middle(_text(raw_content), tool_cap, "historical tool output")
+            header = f"Tool result for {names.get(cid, 'tool')} (already executed):\n<<<{fence}\n"
+            footer = f"\n{fence}>>>"
+            wrapper_len = _utf8_bytes(header) + _utf8_bytes(footer)
+            if line_cap is not None and line_cap <= wrapper_len:
+                return _trim_utf8_middle(header + _text(raw_content) + footer, line_cap, "tool output")
+            body_limit = None if line_cap is None else line_cap - wrapper_len
+            eff_cap = tool_cap if body_limit is None else (body_limit if tool_cap is None else min(tool_cap, body_limit))
+            raw_imgs = images(raw_content) if isinstance(raw_content, list) else []
+            if eff_cap is not None and _utf8_bytes(_text(raw_content)) + len(raw_imgs) * 24 > eff_cap:
+                body_text = _trim_utf8_middle(_text(raw_content), eff_cap, "tool output")
             else:
                 body_text = img_sink.text(raw_content)
-            return (f"Tool result for {names.get(cid, 'tool')} (already executed):\n<<<{fence}\n"
-                    f"{body_text}\n{fence}>>>")
-        return f"{str(role).capitalize()}: {img_sink.text(m.get('content'))}"
+            return header + body_text + footer
+        prefix = f"{str(role).capitalize()}: "
+        raw_content = m.get("content")
+        if line_cap is not None:
+            body_cap = line_cap - _utf8_bytes(prefix)
+            if body_cap <= 0:
+                return _utf8_head(prefix + _text(raw_content), max(0, line_cap))
+            raw_imgs = images(raw_content) if isinstance(raw_content, list) else []
+            if _utf8_bytes(_text(raw_content)) + len(raw_imgs) * 24 > body_cap:
+                return prefix + _trim_content_with_images(raw_content, img_sink, body_cap, f"{role} message")
+        return prefix + img_sink.text(raw_content)
 
     def _assemble(sys_texts: list[str], hist_lines: list[str], act_text: str, prog_lines: list[str]) -> str:
         parts = []
@@ -317,17 +357,25 @@ def render_replay(messages: list[dict[str, Any]], imgs: _Images | None = None,
         *,
         sys_texts: list[str],
         hist_tool_cap: int | None = None,
+        hist_line_cap: int | None = None,
         prog_tool_cap: int | None = None,
+        prog_line_cap: int | None = None,
         active_cap: int | None = None,
         omit_note: str | None = None,
     ) -> tuple[str, set[str]]:
         sent: set[str] = set()
         if last_user >= 0:
-            hist_lines = [line(m, img_sink, tool_cap=hist_tool_cap) for m in hist_msgs]
-            act_text = img_sink.text(msgs[last_user].get("content"))
-            if active_cap is not None and _utf8_bytes(act_text) > active_cap:
-                act_text = _trim_utf8_middle(_text(msgs[last_user].get("content")), active_cap, "active request")
-            prog_lines = [line(m, img_sink, tool_cap=prog_tool_cap) for m in prog_msgs]
+            hist_lines = [line(m, img_sink, tool_cap=hist_tool_cap, line_cap=hist_line_cap) for m in hist_msgs]
+            raw_active = msgs[last_user].get("content")
+            if active_cap is not None:
+                raw_imgs = images(raw_active) if isinstance(raw_active, list) else []
+                if _utf8_bytes(_text(raw_active)) + len(raw_imgs) * 24 > active_cap:
+                    act_text = _trim_content_with_images(raw_active, img_sink, active_cap, "active request")
+                else:
+                    act_text = img_sink.text(raw_active)
+            else:
+                act_text = img_sink.text(raw_active)
+            prog_lines = [line(m, img_sink, tool_cap=prog_tool_cap, line_cap=prog_line_cap) for m in prog_msgs]
             later = frozenset(_sys_digests(act_text + "".join(prog_lines)))
             act_text = dedupe_system_messages(act_text, sent)
             prog_lines = [dedupe_system_messages(x, sent) for x in prog_lines]
@@ -336,7 +384,10 @@ def render_replay(messages: list[dict[str, Any]], imgs: _Images | None = None,
                 hist_lines = [omit_note, *hist_lines]
         else:
             hist_lines, act_text = [], ""
-            prog_lines = [dedupe_system_messages(line(m, img_sink, tool_cap=prog_tool_cap), sent) for m in prog_msgs]
+            prog_lines = [
+                dedupe_system_messages(line(m, img_sink, tool_cap=prog_tool_cap, line_cap=prog_line_cap), sent)
+                for m in prog_msgs
+            ]
         return _assemble(sys_texts, hist_lines, act_text, prog_lines), sent
 
     if last_user >= 0:
@@ -347,8 +398,10 @@ def render_replay(messages: list[dict[str, Any]], imgs: _Images | None = None,
         raw_progress = [m for m in msgs if m.get("role") != "system"]
 
     # Reserve a small margin for any skipped-image header note added by _Images.blocks().
-    budget = max(512, int(max_bytes) - 128)
-    probe_text, probe_sent = _render_pass(raw_history, raw_progress, _Images(), sys_texts=system)
+    target_max = max(0, int(max_bytes))
+    margin = min(96, target_max // 4)
+    budget = max(0, target_max - margin)
+    probe_text, _ = _render_pass(raw_history, raw_progress, _Images(), sys_texts=system)
     orig_bytes = _utf8_bytes(probe_text)
     if orig_bytes <= budget:
         final_text, sent = _render_pass(raw_history, raw_progress, imgs, sys_texts=system)
@@ -356,20 +409,29 @@ def render_replay(messages: list[dict[str, Any]], imgs: _Images | None = None,
             seen_sys.update(sent)
         return imgs.blocks(final_text)
 
-    # Over budget: (1) shrink oversized historical tool outputs first, (2) drop oldest historical turns,
+    # Over budget: (1) shrink oversized historical tool/assistant messages first, (2) drop oldest historical turns,
     # (3) as last resort trim progress / system / active so <ACTIVE_REQUEST> is never amputated by agy.
-    hist_tool_cap: int | None = _HISTORY_TOOL_TRIM_BYTES
+    hist_tool_cap: int | None = min(_HISTORY_TOOL_TRIM_BYTES, max(256, budget // 8))
+    hist_line_cap: int | None = hist_tool_cap
     prog_tool_cap: int | None = None
+    prog_line_cap: int | None = None
     active_cap: int | None = None
     sys_texts = list(system)
     kept_history = list(raw_history)
     kept_progress = list(raw_progress)
     omit_note: str | None = None
 
-    candidate, _ = _render_pass(kept_history, kept_progress, _Images(), sys_texts=sys_texts,
-                                hist_tool_cap=hist_tool_cap)
+    def _probe() -> str:
+        text, _ = _render_pass(
+            kept_history, kept_progress, _Images(), sys_texts=sys_texts,
+            hist_tool_cap=hist_tool_cap, hist_line_cap=hist_line_cap,
+            prog_tool_cap=prog_tool_cap, prog_line_cap=prog_line_cap,
+            active_cap=active_cap, omit_note=omit_note,
+        )
+        return text
+
+    candidate = _probe()
     if _utf8_bytes(candidate) > budget and kept_history:
-        # Measure fixed sections (system + active + progress) without history.
         base_text, _ = _render_pass([], kept_progress, _Images(), sys_texts=sys_texts)
         base_bytes = _utf8_bytes(base_text)
         wrapper_overhead = _utf8_bytes(
@@ -383,7 +445,6 @@ def render_replay(messages: list[dict[str, Any]], imgs: _Images | None = None,
             kept_history = []
             omit_note = f"[... {dropped} earlier historical messages omitted to fit the replay byte budget ...]"
         else:
-            # Measure each historical line with tool trimming + active-first dedupe, then keep newest tail.
             scratch_imgs = _Images()
             act_probe = scratch_imgs.text(msgs[last_user].get("content")) if last_user >= 0 else ""
             prog_probe = [line(m, scratch_imgs) for m in kept_progress]
@@ -393,8 +454,10 @@ def render_replay(messages: list[dict[str, Any]], imgs: _Images | None = None,
             for p in prog_probe:
                 dedupe_system_messages(p, sent_probe)
             line_sizes = [
-                _utf8_bytes(dedupe_system_messages(line(m, _Images(), tool_cap=hist_tool_cap), set(sent_probe),
-                                                   later_probe)) + 1
+                _utf8_bytes(dedupe_system_messages(
+                    line(m, _Images(), tool_cap=hist_tool_cap, line_cap=hist_line_cap),
+                    set(sent_probe), later_probe,
+                )) + 1
                 for m in kept_history
             ]
             used = 0
@@ -409,44 +472,104 @@ def render_replay(messages: list[dict[str, Any]], imgs: _Images | None = None,
             if dropped > 0:
                 omit_note = f"[... {dropped} earlier historical messages omitted to fit the replay byte budget ...]"
 
-    candidate, _ = _render_pass(kept_history, kept_progress, _Images(), sys_texts=sys_texts,
-                                hist_tool_cap=hist_tool_cap, omit_note=omit_note)
-    # Trim any remaining overflow in history (e.g. if dedupe differed slightly) by dropping from front.
+    candidate = _probe()
     while _utf8_bytes(candidate) > budget and kept_history:
         kept_history = kept_history[1:]
         dropped = len(raw_history) - len(kept_history)
         omit_note = f"[... {dropped} earlier historical messages omitted to fit the replay byte budget ...]"
-        candidate, _ = _render_pass(kept_history, kept_progress, _Images(), sys_texts=sys_texts,
-                                    hist_tool_cap=hist_tool_cap, omit_note=omit_note)
+        candidate = _probe()
+    if _utf8_bytes(candidate) > budget and not kept_history and omit_note:
+        omit_note = None
+        candidate = _probe()
+
+    prog_wrapper_overhead = _utf8_bytes(
+        "\n\n<ACTIVE_REQUEST_PROGRESS>\nAlready completed for this request; continue from here, do not "
+        "repeat these tool calls.\n\n\n</ACTIVE_REQUEST_PROGRESS>"
+    )
+    sys_wrapper_overhead = _utf8_bytes("<SYSTEM_INSTRUCTIONS>\n\n</SYSTEM_INSTRUCTIONS>\n\n")
 
     # Last-resort trimming if fixed sections (system + active + progress) alone exceed budget.
     if _utf8_bytes(candidate) > budget and kept_progress:
-        prog_tool_cap = _HISTORY_TOOL_TRIM_BYTES
-        candidate, _ = _render_pass(kept_history, kept_progress, _Images(), sys_texts=sys_texts,
-                                    hist_tool_cap=hist_tool_cap, prog_tool_cap=prog_tool_cap, omit_note=omit_note)
+        prog_line_cap = min(_HISTORY_TOOL_TRIM_BYTES, max(128, budget // 4))
+        prog_tool_cap = prog_line_cap
+        candidate = _probe()
         while _utf8_bytes(candidate) > budget and len(kept_progress) > 1:
             kept_progress = kept_progress[1:]
-            candidate, _ = _render_pass(kept_history, kept_progress, _Images(), sys_texts=sys_texts,
-                                        hist_tool_cap=hist_tool_cap, prog_tool_cap=prog_tool_cap, omit_note=omit_note)
+            candidate = _probe()
+        if _utf8_bytes(candidate) > budget and kept_progress:
+            no_prog, _ = _render_pass(
+                kept_history, [], _Images(), sys_texts=sys_texts,
+                hist_tool_cap=hist_tool_cap, hist_line_cap=hist_line_cap,
+                active_cap=active_cap, omit_note=omit_note,
+            )
+            avail_prog = budget - _utf8_bytes(no_prog) - prog_wrapper_overhead
+            if avail_prog >= 64:
+                prog_line_cap = prog_tool_cap = avail_prog
+            elif last_user >= 0:
+                kept_progress = []
+            candidate = _probe()
+
     if _utf8_bytes(candidate) > budget and sys_texts:
-        over = _utf8_bytes(candidate) - budget
-        joined_sys = "\n\n".join(sys_texts)
-        sys_limit = max(256, _utf8_bytes(joined_sys) - over - 64)
-        sys_texts = [_trim_utf8_middle(joined_sys, sys_limit, "system instructions")]
-        candidate, _ = _render_pass(kept_history, kept_progress, _Images(), sys_texts=sys_texts,
-                                    hist_tool_cap=hist_tool_cap, prog_tool_cap=prog_tool_cap, omit_note=omit_note)
+        no_sys, _ = _render_pass(
+            kept_history, kept_progress, _Images(), sys_texts=[],
+            hist_tool_cap=hist_tool_cap, hist_line_cap=hist_line_cap,
+            prog_tool_cap=prog_tool_cap, prog_line_cap=prog_line_cap,
+            active_cap=active_cap, omit_note=omit_note,
+        )
+        avail_sys = budget - _utf8_bytes(no_sys) - sys_wrapper_overhead
+        if avail_sys >= 32:
+            sys_texts = [_trim_utf8_middle("\n\n".join(sys_texts), avail_sys, "system instructions")]
+        else:
+            sys_texts = []
+        candidate = _probe()
+
     if _utf8_bytes(candidate) > budget and last_user >= 0:
-        over = _utf8_bytes(candidate) - budget
-        act_raw_bytes = _utf8_bytes(_text(msgs[last_user].get("content")))
-        active_cap = max(128, act_raw_bytes - over - 64)
-        candidate, _ = _render_pass(kept_history, kept_progress, _Images(), sys_texts=sys_texts,
-                                    hist_tool_cap=hist_tool_cap, prog_tool_cap=prog_tool_cap,
-                                    active_cap=active_cap, omit_note=omit_note)
+        empty_act, _ = _render_pass(
+            kept_history, kept_progress, _Images(), sys_texts=sys_texts,
+            hist_tool_cap=hist_tool_cap, hist_line_cap=hist_line_cap,
+            prog_tool_cap=prog_tool_cap, prog_line_cap=prog_line_cap,
+            active_cap=0, omit_note=omit_note,
+        )
+        active_cap = max(0, budget - _utf8_bytes(empty_act))
+        candidate = _probe()
+
+    if _utf8_bytes(candidate) > budget and kept_progress:
+        no_prog, _ = _render_pass(
+            kept_history, [], _Images(), sys_texts=sys_texts,
+            hist_tool_cap=hist_tool_cap, hist_line_cap=hist_line_cap,
+            active_cap=active_cap, omit_note=omit_note,
+        )
+        avail_prog = budget - _utf8_bytes(no_prog) - prog_wrapper_overhead
+        if avail_prog >= 16:
+            prog_line_cap = prog_tool_cap = avail_prog
+        else:
+            kept_progress = []
+        candidate = _probe()
+
+    # Extreme tiny max_bytes where static XML wrapper tags alone exceed target_max: clamp without mutating imgs.
+    if _utf8_bytes(candidate) > target_max:
+        scratch = _Images()
+        raw_cand, _ = _render_pass(
+            kept_history, kept_progress, scratch, sys_texts=sys_texts,
+            hist_tool_cap=hist_tool_cap, hist_line_cap=hist_line_cap,
+            prog_tool_cap=prog_tool_cap, prog_line_cap=prog_line_cap,
+            active_cap=active_cap, omit_note=omit_note,
+        )
+        plain_cand = scratch._sentinel.sub("[image]", raw_cand)
+        final_text = _utf8_head(plain_cand, target_max)
+        logger.warning(
+            "acp-mcp replay clamped: %d -> %d UTF-8 bytes (max_bytes=%d)",
+            orig_bytes, _utf8_bytes(final_text), target_max,
+        )
+        return imgs.blocks(final_text)
 
     # Final render against the caller's real _Images and seen_sys so dropped old history images are never attached.
-    final_text, sent = _render_pass(kept_history, kept_progress, imgs, sys_texts=sys_texts,
-                                    hist_tool_cap=hist_tool_cap, prog_tool_cap=prog_tool_cap,
-                                    active_cap=active_cap, omit_note=omit_note)
+    final_text, sent = _render_pass(
+        kept_history, kept_progress, imgs, sys_texts=sys_texts,
+        hist_tool_cap=hist_tool_cap, hist_line_cap=hist_line_cap,
+        prog_tool_cap=prog_tool_cap, prog_line_cap=prog_line_cap,
+        active_cap=active_cap, omit_note=omit_note,
+    )
     if seen_sys is not None:
         seen_sys.update(sent)
     logger.warning(

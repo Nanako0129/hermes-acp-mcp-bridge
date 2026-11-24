@@ -383,3 +383,56 @@ def test_replay_budget_handles_oversized_system_and_cjk_safely():
     full_text = "".join(b["text"] for b in blocks if b["type"] == "text")
     assert len(full_text.encode("utf-8")) <= 4_000
     assert "<ACTIVE_REQUEST>\n最後一個真正的問題\n</ACTIVE_REQUEST>" in full_text
+
+
+@pytest.mark.parametrize("limit", [200, 1_024, 4_000, 180_000])
+def test_replay_budget_enforces_limit_on_oversized_progress_and_assistant_calls(limit):
+    msgs_tool = [
+        {"role": "system", "content": "sys " * 500},
+        {"role": "user", "content": "active question 🚀 " + ("漢" * 1000)},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "write_file",
+                                                          "arguments": '{"body":"' + ("W" * 200_000) + '"}'}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "T" * 200_000},
+    ]
+    msgs_asst = [
+        {"role": "system", "content": "sys " * 500},
+        {"role": "user", "content": "active question 🎉 " + ("字" * 1000)},
+        {"role": "assistant", "content": "A" * 200_000},
+    ]
+    msgs_no_user = [{"role": "assistant", "content": "N" * 200_000}]
+    for msgs in (msgs_tool, msgs_asst, msgs_no_user):
+        blocks = render_replay(msgs, max_bytes=limit)
+        full_text = "".join(b["text"] for b in blocks if b["type"] == "text")
+        assert len(full_text.encode("utf-8")) <= limit
+
+
+def test_replay_budget_oversized_active_with_image_has_no_orphan_registration():
+    from antigravity_acp_mcp.conversation import MAX_REPLAY_BYTES, _Images
+    msgs = [
+        SYS,
+        {"role": "user", "content": [
+            {"type": "text", "text": "LONG-" + ("漢" * 70_000) + "-END"},
+            img(PNG_B),
+        ]},
+    ]
+    sink = _Images()
+    blocks = render_replay(msgs, imgs=sink, max_bytes=MAX_REPLAY_BYTES)
+    full_text = "".join(b["text"] for b in blocks if b["type"] == "text")
+    assert len(full_text.encode("utf-8")) <= MAX_REPLAY_BYTES
+    assert image_blocks(blocks) == [("image/png", PNG_B)]
+    assert len(sink.items) == 1 and "[image #1]" in full_text
+
+    tiny_sink = _Images()
+    tiny_blocks = render_replay(msgs, imgs=tiny_sink, max_bytes=200)
+    tiny_text = "".join(b["text"] for b in tiny_blocks if b["type"] == "text")
+    assert len(tiny_text.encode("utf-8")) <= 200
+    assert len(image_blocks(tiny_blocks)) == len(tiny_sink.items)
+    if tiny_sink.items:
+        assert "[image #1]" in tiny_text
+
+    clamp_sink = _Images()
+    clamp_blocks = render_replay(msgs, imgs=clamp_sink, max_bytes=80)
+    clamp_text = "".join(b["text"] for b in clamp_blocks if b["type"] == "text")
+    assert len(clamp_text.encode("utf-8")) <= 80
+    assert image_blocks(clamp_blocks) == [] and len(clamp_sink.items) == 0
