@@ -39,11 +39,13 @@ from .matcher import (
     TurnView,
     IMAGE_PART_TYPES,
     _text,
+    batch_entries,
     canonical_args,
     classify,
     explain_mismatch,
     fingerprint,
     images,
+    is_guarded,
     project,
     trailing_tool_round,
     view_after,
@@ -223,7 +225,7 @@ class _Images:
                     n = self._index[img[0][1]] = len(self.items)
                 parts.append(f"{self._tag}{n}\x1f")
             else:
-                parts.append(str(part.get("text") or part.get("type") or ""))
+                parts.append(_text([part]))  # same rule as matcher._text: an empty text part stays empty
         return "\n".join(parts)
 
     def blocks(self, text: str) -> list[dict[str, Any]]:
@@ -891,7 +893,7 @@ class Conversation:
         if gen != self.gen:
             call.answer("session retired", is_error=True)  # straggler from a retired session (M1)
             return
-        if (call.name, canonical_args(call.arguments)) in self.guard:
+        if is_guarded(call.name, call.arguments, self.guard):
             self.guard_refusals += 1
             call.answer(GUARD_TEXT, is_error=True)  # replay guard: never handed to Hermes twice
             if self.guard_refusals >= 2:
@@ -989,7 +991,9 @@ class Conversation:
                     if self.gen != gen or token.is_set():
                         continue  # retired/cancelled meanwhile: the loop top raises
                     self.handed = calls
-                    self.view = view_after(messages, handed_out=tuple(c.id for c in calls), live=True)
+                    self.view = view_after(messages, handed_out=tuple(c.id for c in calls),
+                                           handed_sizes=tuple(max(1, len(batch_entries(c.name, c.arguments)))
+                                                              for c in calls), live=True)
                     if self.stateless:
                         self._retire("stateless-handout")  # children continue through replay (component 9)
                     elif self.terminal_tools and all(c.name in self.terminal_tools for c in calls):

@@ -36,6 +36,7 @@ class TurnView:
     prefix_fp: str = ""  # fingerprint of project(messages[:consumed])
     seen: tuple = ()  # project(messages[:consumed]) for diagnostics only (explain_mismatch); never logged raw
     handed_out: tuple[str, ...] = ()  # H: call ids returned to Hermes as tool_calls, not yet answered
+    handed_sizes: tuple[int, ...] = ()  # per H entry: batch entry count (1 unless a tool_call batch)
     live: bool = False  # a prompt is in flight or parked
     retired: bool = False  # the session was cancelled and must never be prompted again
 
@@ -79,8 +80,10 @@ def _text(content: Any) -> str:
         parts = []
         for part in content:
             if isinstance(part, dict):
-                parts.append("[image]" if part.get("type") in IMAGE_PART_TYPES
-                             else str(part.get("text") or part.get("type") or ""))
+                kind = part.get("type")
+                parts.append("[image]" if kind in IMAGE_PART_TYPES
+                             else str(part.get("text") or "") if kind in (None, "text")  # empty text stays empty
+                             else str(part.get("text") or kind))
             else:
                 parts.append(str(part))
         return "\n".join(parts)
@@ -112,12 +115,52 @@ def fingerprint(messages: list[dict[str, Any]]) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def view_after(messages: list[dict[str, Any]], *, handed_out: tuple[str, ...] = (), live: bool = False) -> TurnView:
+def view_after(messages: list[dict[str, Any]], *, handed_out: tuple[str, ...] = (),
+               handed_sizes: tuple[int, ...] = (), live: bool = False) -> TurnView:
     """The view once a prompt step ends: Hermes will append one assistant message (text, or tool_calls = H)."""
     pending = {"role": "assistant", "tool_calls": [{"id": i} for i in handed_out]}
     seen = [*[m for m in messages if isinstance(m, dict)], pending]
-    return TurnView(consumed=len(seen), prefix_fp=fingerprint(seen), handed_out=handed_out, live=live,
-                    seen=tuple(project(m) for m in seen))
+    return TurnView(consumed=len(seen), prefix_fp=fingerprint(seen), handed_out=handed_out,
+                    handed_sizes=handed_sizes, live=live, seen=tuple(project(m) for m in seen))
+
+
+def batch_entries(name: str, arguments: Any) -> list[dict[str, Any]]:
+    """The entries of a ``tool_call`` batch as Hermes normalizes them (``tools/tool_search_validation.
+    normalize_tool_call_entries``: ``{"name", "arguments": dict}``); [] for any other call or a malformed one."""
+    if name != TOOL_CALL_NAME:
+        return []
+    try:
+        args = json.loads(arguments or "{}") if isinstance(arguments, str) else arguments
+        raw = args.get("calls")
+        if raw is None:  # legacy single shape
+            raw = [{"name": args.get("name"), "arguments": args.get("arguments")}]
+        raw = json.loads(raw) if isinstance(raw, str) else raw
+        raw = [raw] if isinstance(raw, dict) else raw
+        entries = []
+        for e in raw:
+            a = e.get("arguments")
+            a = {} if a is None or (isinstance(a, str) and not a.strip()) else a
+            a = json.loads(a) if isinstance(a, str) else a
+            if not str(e.get("name") or "").strip() or not isinstance(a, dict):
+                return []
+            entries.append({"name": str(e["name"]).strip(), "arguments": a})
+        return entries
+    except (AttributeError, TypeError, ValueError):
+        return []
+
+
+def entry_keys(name: str, arguments: Any) -> set[tuple[str, str]]:
+    """Guard keys of a ``tool_call`` batch, one per normalized entry: the shape Hermes persists a split child in,
+    and spelling-independent for an unsplit one (string vs dict arguments, legacy single shape)."""
+    return {(TOOL_CALL_NAME, canonical_args({"calls": [e]})) for e in batch_entries(name, arguments)}
+
+
+def is_guarded(name: str, arguments: Any, guard: set[tuple[str, str]]) -> bool:
+    """Replay guard: the call, or every entry of a ``tool_call`` batch, already ran in the round being replayed.
+    A partly answered batch is let through (its answered entries run again): refusing it would report entries
+    that never ran as done."""
+    keys = entry_keys(name, arguments)
+    return (name, canonical_args(arguments)) in guard or bool(keys) and keys <= guard
 
 
 def is_guest_shape(messages: list[dict[str, Any]], tools: list[Any] | None) -> bool:
@@ -128,7 +171,8 @@ def is_guest_shape(messages: list[dict[str, Any]], tools: list[Any] | None) -> b
     return bool(users) and _text(users[-1].get("content")).lstrip().startswith(BTW_FORK_MARKER)
 
 
-def _held_groups(row: dict[str, Any], handed_out: tuple[str, ...]) -> dict[str, list[str]] | None:
+def _held_groups(row: dict[str, Any], handed_out: tuple[str, ...],
+                 handed_sizes: tuple[int, ...] = ()) -> dict[str, list[str]] | None:
     """Map each handed-out call id to the row's call ids that answer it, or None when the row is not ours.
 
     Hermes core (``agent/tool_call_batches.expand_local_tool_batches``) splits one ``tool_call`` wrapper call
@@ -149,7 +193,13 @@ def _held_groups(row: dict[str, Any], handed_out: tuple[str, ...]) -> dict[str, 
             current.append(cid)
         else:
             return None
-    return groups if set(groups) == held else None
+    if set(groups) != held:
+        return None
+    # A split parent gains at most (entries - 1) siblings: fewer when Hermes's post-split guardrails drop calls
+    # (agent/turn_tool_round.py: _deduplicate_tool_calls, _cap_delegate_task_calls), none when it leaves an
+    # oversized/connector batch whole.
+    sizes = dict(zip(handed_out, handed_sizes))
+    return groups if all(len(g) <= sizes.get(h, len(g)) for h, g in groups.items()) else None
 
 
 def _merge_contents(contents: list[Any]) -> Any:
@@ -159,7 +209,7 @@ def _merge_contents(contents: list[Any]) -> Any:
     parts: list[Any] = []
     for k, content in enumerate(contents, 1):
         parts.append({"type": "text", "text": f"[result {k}/{len(contents)}]"})
-        parts.extend(content if isinstance(content, list) else [{"type": "text", "text": _text(content)}])
+        parts.extend(content if isinstance(content, list) else [_text(content)])  # bare str: "" stays empty
     return parts
 
 
@@ -172,7 +222,7 @@ def classify(messages: list[dict[str, Any]], view: TurnView | None, tools: list[
     if view.handed_out:
         last_call = max((i for i, m in enumerate(msgs) if m.get("role") == "assistant" and m.get("tool_calls")),
                         default=-1)
-        groups = _held_groups(msgs[last_call], view.handed_out) if last_call >= 0 else None
+        groups = _held_groups(msgs[last_call], view.handed_out, view.handed_sizes) if last_call >= 0 else None
         if groups is not None:
             tail = msgs[last_call + 1:]
             ids = [str(m.get("tool_call_id") or "") for m in tail]
@@ -240,6 +290,9 @@ def trailing_tool_round(messages: list[dict[str, Any]]) -> set[tuple[str, str]]:
                 if isinstance(tc, dict) and str(tc.get("id") or "") in answered:
                     fn = tc.get("function") or {}
                     seed.add((str(fn.get("name") or ""), canonical_args(fn.get("arguments"))))
+                    keys = entry_keys(str(fn.get("name") or ""), fn.get("arguments"))
+                    if len(keys) == 1:  # a split child or a one-entry batch; a batch left whole may not have run
+                        seed |= keys
             return seed
         if m.get("role") == "user":
             return set()
