@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 BTW_FORK_MARKER = "The user asked a quick SIDE question with /btw"
+TOOL_CALL_NAME = "tool_call"  # Hermes's deferred-tool wrapper (tools/tool_search_catalog.TOOL_CALL_NAME)
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,41 @@ def is_guest_shape(messages: list[dict[str, Any]], tools: list[Any] | None) -> b
     return bool(users) and _text(users[-1].get("content")).lstrip().startswith(BTW_FORK_MARKER)
 
 
+def _held_groups(row: dict[str, Any], handed_out: tuple[str, ...]) -> dict[str, list[str]] | None:
+    """Map each handed-out call id to the row's call ids that answer it, or None when the row is not ours.
+
+    Hermes core (``agent/tool_call_batches.expand_local_tool_batches``) splits one ``tool_call`` wrapper call
+    carrying ``{"calls": [e1, e2, ...]}`` into N ``tool_call`` entries before persisting: the first keeps the parent
+    id, the rest get new ids right after it. Without this, every batched call looked like a foreign row and forced
+    a replay (measured on a live gateway 2026-11-27: 30 of 31 replays in one turn, 113 API calls, 646 s).
+    """
+    held = set(handed_out)
+    groups: dict[str, list[str]] = {}
+    current, current_name = None, None
+    for tc in row.get("tool_calls") or []:
+        if not isinstance(tc, dict):
+            return None
+        cid, name = str(tc.get("id") or ""), (tc.get("function") or {}).get("name")
+        if cid in held and cid not in groups:
+            current, current_name = groups.setdefault(cid, [cid]), name
+        elif current is not None and current_name == name == TOOL_CALL_NAME:  # a split sibling
+            current.append(cid)
+        else:
+            return None
+    return groups if set(groups) == held else None
+
+
+def _merge_contents(contents: list[Any]) -> Any:
+    """One parked MCP result from the tool rows of a split batch, in call order; a single row passes through."""
+    if len(contents) == 1:
+        return contents[0]
+    parts: list[Any] = []
+    for k, content in enumerate(contents, 1):
+        parts.append({"type": "text", "text": f"[result {k}/{len(contents)}]"})
+        parts.extend(content if isinstance(content, list) else [{"type": "text", "text": _text(content)}])
+    return parts
+
+
 def classify(messages: list[dict[str, Any]], view: TurnView | None, tools: list[Any] | None = None) -> Decision:
     msgs = [m for m in messages if isinstance(m, dict)]
     if view is None or view.consumed == 0:
@@ -134,15 +170,18 @@ def classify(messages: list[dict[str, Any]], view: TurnView | None, tools: list[
     if view.live and is_guest_shape(msgs, tools):
         return Decision("guest")
     if view.handed_out:
-        held = set(view.handed_out)
         last_call = max((i for i, m in enumerate(msgs) if m.get("role") == "assistant" and m.get("tool_calls")),
                         default=-1)
-        if last_call >= 0 and set(_tool_call_ids(msgs[last_call])) == held:
+        groups = _held_groups(msgs[last_call], view.handed_out) if last_call >= 0 else None
+        if groups is not None:
             tail = msgs[last_call + 1:]
             ids = [str(m.get("tool_call_id") or "") for m in tail]
-            if tail and all(m.get("role") == "tool" for m in tail) and len(ids) == len(set(ids)) and set(ids) == held:
-                return Decision("resume_held", tool_results={str(m["tool_call_id"]): m.get("content")
-                                                             for m in tail})
+            row_ids = {c for g in groups.values() for c in g}
+            if tail and all(m.get("role") == "tool" for m in tail) and len(ids) == len(set(ids)) \
+                    and set(ids) == row_ids:
+                by_id = {str(m["tool_call_id"]): m.get("content") for m in tail}
+                return Decision("resume_held", tool_results={
+                    held: _merge_contents([by_id[c] for c in g]) for held, g in groups.items()})
     if len(msgs) <= view.consumed or fingerprint(msgs[:view.consumed]) != view.prefix_fp:
         return Decision("replay")
     delta = msgs[view.consumed:]

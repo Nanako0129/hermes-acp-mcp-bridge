@@ -38,6 +38,39 @@ def test_resume_held_single_and_parallel_any_order():
     assert d.tool_results == {"call_a": "A", "call_b": "B"}
 
 
+def split_row(*cids):
+    """Hermes core's expand_local_tool_batches output: one tool_call parent split into N tool_call entries."""
+    return {"role": "assistant", "content": "", "tool_calls": [call(c, name="tool_call") for c in cids]}
+
+
+def test_resume_held_after_hermes_splits_a_tool_call_batch():
+    base = [SYS, U1]
+    view = view_after(base, handed_out=("p",), live=True)
+    msgs = [*base, split_row("p", "k1", "k2"), tool("k2", "C"), tool("p", "A"), tool("k1", "B")]
+    d = classify(msgs, view)
+    assert d.kind == "resume_held"
+    assert [p["text"] for p in d.tool_results["p"]] == ["[result 1/3]", "A", "[result 2/3]", "B",
+                                                         "[result 3/3]", "C"]
+
+
+def test_split_siblings_follow_their_own_parent():
+    base = [SYS, U1]
+    view = view_after(base, handed_out=("p", "q"), live=True)
+    row = split_row("p", "k1", "q", "k2")
+    d = classify([*base, row, tool("p", "A"), tool("k1", "B"), tool("q", "C"), tool("k2", "D")], view)
+    assert d.kind == "resume_held"
+    assert [p["text"] for p in d.tool_results["q"]] == ["[result 1/2]", "C", "[result 2/2]", "D"]
+
+
+def test_foreign_extra_call_still_replays():
+    base = [SYS, U1]
+    view = view_after(base, handed_out=("call_a",), live=True)  # a plain call cannot gain siblings
+    msgs = [*base, asst_calls("call_a", "x"), tool("call_a"), tool("x")]
+    assert classify(msgs, view).kind == "replay"
+    view = view_after(base, handed_out=("p",), live=True)  # split sibling without its tool row
+    assert classify([*base, split_row("p", "k1"), tool("p")], view).kind == "replay"
+
+
 def test_dropped_call_without_tool_row_replays():
     base = [SYS, U1]
     view = view_after(base, handed_out=("call_a", "call_b"), live=True)
